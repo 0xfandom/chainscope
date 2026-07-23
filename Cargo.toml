@@ -10,7 +10,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/ozpool/chainscope"
+repository = "https://github.com/0xfandom/chainscope"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
