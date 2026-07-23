@@ -14,6 +14,7 @@
 
 use std::fmt;
 
+use chainscope_core::TransportKind;
 use figment::{
     providers::{Env, Format, Serialized, Toml},
     Figment,
@@ -176,6 +177,7 @@ struct RawChain {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPipeline {
+    transport: Option<String>,
     channel_capacity: Option<usize>,
     batch_size: Option<usize>,
     backfill_chunk_size: Option<u64>,
@@ -217,6 +219,9 @@ pub struct Chain {
 
 #[derive(Debug, Clone)]
 pub struct Pipeline {
+    /// Which transport the stages talk through. The only place in the program
+    /// that decides this; see `chainscope_core::transport::build`.
+    pub transport: TransportKind,
     pub channel_capacity: usize,
     pub batch_size: usize,
     pub backfill_chunk_size: u64,
@@ -356,6 +361,12 @@ impl Config {
         bound("chain.finality_depth", finality_depth, 1, 100_000)?;
 
         // --- pipeline ---
+        let transport = match raw.pipeline.transport.as_deref() {
+            None => TransportKind::Channel,
+            Some(s) => TransportKind::parse(s)
+                .map_err(|why| ConfigError::invalid("pipeline.transport", s, why))?,
+        };
+
         let channel_capacity = raw.pipeline.channel_capacity.unwrap_or(DEFAULT_CHANNEL_CAPACITY);
         bound("pipeline.channel_capacity", channel_capacity as u64, 1, 1_048_576)?;
 
@@ -379,6 +390,7 @@ impl Config {
                 finality_depth,
             },
             pipeline: Pipeline {
+                transport,
                 channel_capacity,
                 batch_size,
                 backfill_chunk_size,
@@ -401,7 +413,7 @@ impl Config {
 
         format!(
             "database.url={} max_connections={} | chain_id={} rpc_endpoints=[{}] factory={} pools={} \
-             start_block={} finality_depth={} | channel_capacity={} batch_size={} backfill_chunk_size={} | log={}",
+             start_block={} finality_depth={} | transport={} channel_capacity={} batch_size={} backfill_chunk_size={} | log={}",
             redact_url(&self.database.url),
             self.database.max_connections,
             self.chain.chain_id,
@@ -410,6 +422,7 @@ impl Config {
             self.chain.pools.len(),
             self.chain.start_block,
             self.chain.finality_depth,
+            self.pipeline.transport.as_str(),
             self.pipeline.channel_capacity,
             self.pipeline.batch_size,
             self.pipeline.backfill_chunk_size,
@@ -560,6 +573,20 @@ mod tests {
         let err = toml_config(&body).unwrap_err().to_string();
         assert!(err.contains("pipeline.batch_size"), "{err}");
         assert!(err.contains("between 1 and 100000"), "{err}");
+    }
+
+    #[test]
+    fn transport_defaults_to_channel() {
+        let c = toml_config(&valid_toml()).unwrap();
+        assert_eq!(c.pipeline.transport, TransportKind::Channel);
+    }
+
+    #[test]
+    fn asking_for_kafka_early_says_when_it_arrives() {
+        let body = format!("{}\n[pipeline]\ntransport = \"kafka\"\n", valid_toml());
+        let err = toml_config(&body).unwrap_err().to_string();
+        assert!(err.contains("pipeline.transport"), "{err}");
+        assert!(err.contains("M5"), "should say when it lands: {err}");
     }
 
     #[test]

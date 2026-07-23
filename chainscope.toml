@@ -37,6 +37,11 @@ start_block = 0
 finality_depth = 64
 
 [pipeline]
+# How the stages talk to each other. "channel" is in-memory, single process.
+# The log-based transport (Redpanda) arrives in M5 and is a change to this line,
+# not to any stage.
+transport = "channel"
+
 # Bounded channels between stages. This is the backpressure knob: when the
 # writer falls behind, the fetcher blocks instead of growing a queue in memory.
 channel_capacity = 1024

@@ -66,6 +66,29 @@ Error: database.url is not set. Set DATABASE_URL in .env, or database.url in cha
 Startup logs a summary of the configuration it ended up with, passwords and API
 keys redacted.
 
+## The transport seam
+
+Stages never call each other. Each one publishes to an `EventSink` and reads
+from an `EventSource`, both defined in `crates/core`, and none of them knows
+what is underneath.
+
+```
+producer --[BlockUnit]--> transformer --[RowBatch]--> writer
+```
+
+Phase 1 is bounded in-memory channels in one process. Phase 2 (M5) is a
+Redpanda topic with the stages split into separate processes. That change is a
+new implementation of two traits plus one line of config — no stage is touched.
+
+Bounded capacity is the backpressure mechanism, not a tuning detail: when the
+writer falls behind, `publish` suspends the fetcher instead of buffering until
+the process runs out of memory. There is a test for exactly that.
+
+The seam is only worth anything if it is actually used, and the failure mode is
+quiet — someone reaches for an `mpsc::Sender` directly because it is shorter.
+`tests/seam_is_not_leaking.rs` fails the build if any file outside
+`crates/core/src/transport.rs` names a transport type.
+
 ## Schema
 
 Migrations live in `migrations/` and are embedded into the binary at compile
