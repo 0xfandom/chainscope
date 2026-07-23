@@ -34,3 +34,13 @@ hex = "0.4"
 url = "2"
 async-trait = "0.1"
 bigdecimal = "0.4"
+# Kept out of the workspace-wide default on purpose: only crates/eth-source may
+# depend on this. If it ever appears under crates/core, the chain boundary has
+# been crossed.
+alloy = { version = "2", default-features = false, features = [
+    "providers",
+    "rpc-types-eth",
+    "transport-http",
+    "reqwest-rustls-tls",
+    "json-rpc",
+] }

@@ -3,7 +3,8 @@
 mod config;
 mod db;
 
-use chainscope_core::{BlockUnit, RowBatch};
+use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
+use chainscope_eth_source::EthSource;
 use config::Config;
 
 #[tokio::main]
@@ -44,6 +45,31 @@ async fn main() -> anyhow::Result<()> {
     let (row_sink, row_source) =
         chainscope_core::build_transport::<RowBatch>(cfg.pipeline.transport, cfg.pipeline.channel_capacity);
     drop((raw_sink, raw_source, row_sink, row_source));
+
+    // Reach the chain once before claiming to be ready. An indexer that cannot
+    // read the chain has nothing to do, so finding out now — with a clear
+    // message — beats discovering it inside a retry loop later.
+    //
+    // Only the first endpoint is used. The failover pool across all configured
+    // endpoints is M3; the trait it hides behind already exists.
+    let watched: Vec<_> = cfg
+        .chain
+        .pools
+        .iter()
+        .map(|a| a.0)
+        .chain(std::iter::once(cfg.chain.factory.0))
+        .collect();
+    let source = EthSource::new(&cfg.chain.rpc_endpoints[0], &watched);
+
+    let tip = source.latest_block().await?;
+    let finalized = source.finalized_block().await?;
+    tracing::info!(
+        tip,
+        finalized,
+        lag = tip - finalized,
+        watching = watched.len(),
+        "chain reachable"
+    );
 
     tracing::info!(
         transport = cfg.pipeline.transport.as_str(),
