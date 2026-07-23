@@ -1,17 +1,26 @@
 //! chainscope ingestion pipeline.
 
+mod config;
 mod db;
+
+use config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // A missing .env is not an error — the environment may already carry the
     // variables, which is how it works in Docker.
     let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
 
-    let pool = db::connect().await?;
+    // Order matters. Configuration is validated first, before a socket is
+    // opened or a query is sent, so a bad address or a missing URL costs
+    // nothing but an error message. Everything after this line can assume the
+    // configuration is complete and well formed.
+    let cfg = Config::load()?;
+
+    init_tracing(&cfg);
+    tracing::info!(config = %cfg.summary(), "configuration loaded");
+
+    let pool = db::connect(&cfg.database).await?;
     tracing::info!("connected to postgres");
 
     db::migrate(&pool).await?;
@@ -20,6 +29,19 @@ async fn main() -> anyhow::Result<()> {
     let created = db::ensure_partitions(&pool).await?;
     tracing::info!(created, "day partitions ensured");
 
-    tracing::info!("schema ready; pipeline not implemented yet");
+    tracing::info!(
+        pools = cfg.chain.pools.len(),
+        chain_id = cfg.chain.chain_id,
+        "schema ready; pipeline not implemented yet"
+    );
     Ok(())
+}
+
+/// RUST_LOG wins over the config file, so a running process can be made verbose
+/// without editing anything on disk.
+fn init_tracing(cfg: &Config) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.log.filter));
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }

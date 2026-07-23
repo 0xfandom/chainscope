@@ -35,6 +35,37 @@ cargo build
 cargo run --bin chainscope-indexer
 ```
 
+## Configuration
+
+Two layers. `chainscope.toml` is committed and holds everything shareable —
+chain id, pool list, tuning knobs. `.env` is not committed and holds the
+secrets: the database URL, and RPC endpoints with API keys in them.
+
+Any value in the file can be overridden from the environment as
+`CHAINSCOPE_<SECTION>__<KEY>` (double underscore between the two):
+
+```sh
+CHAINSCOPE_PIPELINE__BATCH_SIZE=1000
+CHAINSCOPE_CHAIN__POOLS=0xaaa...,0xbbb...   # lists are comma-separated
+```
+
+The environment always wins. `DATABASE_URL` and `RUST_LOG` are honoured under
+their conventional unprefixed names.
+
+Everything is validated before the process opens a socket: addresses must be
+20 bytes of hex, URLs must parse and carry a sensible scheme, the pool list must
+be non-empty and free of duplicates, numbers must be inside documented bounds,
+and an unknown key is an error rather than a setting that quietly does nothing.
+A failure names the field and echoes the bad value:
+
+```
+Error: chain.pools[0]: an address is 40 hex characters after the 0x prefix (got `0xdeadbeef`)
+Error: database.url is not set. Set DATABASE_URL in .env, or database.url in chainscope.toml.
+```
+
+Startup logs a summary of the configuration it ended up with, passwords and API
+keys redacted.
+
 ## Schema
 
 Migrations live in `migrations/` and are embedded into the binary at compile
