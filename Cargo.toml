@@ -28,3 +28,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "chrono",
 ] }
 dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+hex = "0.4"
+url = "2"

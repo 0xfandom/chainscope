@@ -9,21 +9,21 @@
 use anyhow::Context;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+use crate::config::Database;
+
 /// Migrations live at the workspace root, not inside this crate, because the
 /// API binary and any operator running `sqlx migrate` by hand need the same set.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
-/// Connect to Postgres using `DATABASE_URL`.
+/// Connect to Postgres.
 ///
-/// Reading the environment directly is deliberate scaffolding: issue #3 replaces
-/// this with real configuration loading and startup validation.
-pub async fn connect() -> anyhow::Result<PgPool> {
-    let url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL is not set — copy .env.example to .env")?;
-
+/// Takes an already-validated `Database` config rather than reading the
+/// environment, so this function cannot be the place a configuration mistake
+/// surfaces — by the time it runs, the URL is known to parse.
+pub async fn connect(cfg: &Database) -> anyhow::Result<PgPool> {
     PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
+        .max_connections(cfg.max_connections)
+        .connect(&cfg.url)
         .await
         .context("could not connect to Postgres — is `docker compose up -d` running?")
 }

@@ -17,3 +17,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sqlx.workspace = true
 dotenvy.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+figment.workspace = true
+hex.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+# `test` brings in figment::Jail, which gives each test its own temporary
+# directory and environment and restores both afterwards — the only safe way to
+# test environment-variable layering, since the environment is process-global.
+figment = { version = "0.10", features = ["toml", "env", "test"] }

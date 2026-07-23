@@ -1,0 +1,53 @@
+# Chainscope configuration.
+#
+# This file holds everything shareable. Anything secret — the database URL and
+# RPC endpoints, which carry API keys — belongs in .env instead, because this
+# file is committed and .env is not.
+#
+# Every value here can be overridden by an environment variable named
+# CHAINSCOPE_<SECTION>__<KEY>, double underscore between the two, e.g.
+#   CHAINSCOPE_PIPELINE__BATCH_SIZE=1000
+#   CHAINSCOPE_CHAIN__POOLS=0xaaa...,0xbbb...      (lists are comma-separated)
+# The environment always wins.
+
+[database]
+# url comes from DATABASE_URL in .env — deliberately not set here.
+max_connections = 5
+
+[chain]
+chain_id = 1
+
+# rpc_endpoints comes from CHAINSCOPE_CHAIN__RPC_ENDPOINTS in .env.
+# Two or three providers give failover when one starts rate-limiting.
+
+# Uniswap V3 factory on mainnet. Source of PoolCreated for the sniffer.
+factory = "0x1f98431c8ad98523631ae4a59f267346ea31f984"
+
+# Pools to index. Start with one and widen once the pipeline is proven.
+pools = [
+    "0x8ad599c3a0ff1de082011efddc58f1908eb6e6d8", # USDC/WETH 0.05%
+    "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640", # USDC/WETH 0.3%
+]
+
+# Where the backfill begins. 0 means "from pool creation".
+start_block = 0
+
+# Blocks behind the head before a block is treated as irreversible.
+# ~64 is two Ethereum epochs, which is where Casper FFG finalises.
+finality_depth = 64
+
+[pipeline]
+# Bounded channels between stages. This is the backpressure knob: when the
+# writer falls behind, the fetcher blocks instead of growing a queue in memory.
+channel_capacity = 1024
+
+# Rows per database transaction.
+batch_size = 500
+
+# Blocks per historical backfill work unit. Shrinks automatically when a
+# provider rejects the range as too wide.
+backfill_chunk_size = 2000
+
+[log]
+# tracing-subscriber env filter. RUST_LOG overrides this.
+filter = "info"
