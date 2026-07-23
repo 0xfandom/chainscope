@@ -33,6 +33,8 @@ figment = { version = "0.10", features = ["toml", "env"] }
 hex = "0.4"
 url = "2"
 async-trait = "0.1"
+tokio-util = "0.7"
+rand = "0.9"
 bigdecimal = "0.4"
 # Kept out of the workspace-wide default on purpose: only crates/eth-source may
 # depend on this. If it ever appears under crates/core, the chain boundary has

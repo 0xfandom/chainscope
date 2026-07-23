@@ -1217,15 +1217,18 @@ name = "chainscope-indexer"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chainscope-core",
  "chainscope-eth-source",
  "dotenvy",
  "figment",
  "hex",
+ "rand 0.9.5",
  "serde",
  "sqlx",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",

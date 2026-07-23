@@ -66,6 +66,37 @@ Error: database.url is not set. Set DATABASE_URL in .env, or database.url in cha
 Startup logs a summary of the configuration it ended up with, passwords and API
 keys redacted.
 
+## The producer
+
+The first stage. It reads the live cursor, walks forward one block at a time,
+and publishes each block with its logs into the seam.
+
+Sequential on purpose. Correctness and resumability first; throughput is M3's
+job and reorg detection is M4's. Every block already carries its parent hash
+even though nothing reads it yet — so when reorg detection arrives it changes
+the consumer, not the producer and not the message.
+
+**Where it starts.** A stored cursor always wins, which is what makes a restart
+resume instead of repeat. With no cursor and no configured start block, the live
+follower begins at the *current head* rather than block zero — walking all of
+history one block at a time would take years, and history belongs to the
+backfill.
+
+**Retries.** Only `Transient` errors are retried, with exponential backoff and
+full jitter. The other variants are not retryable by definition: `RangeTooLarge`
+needs a different request, `BlockNotFound` a different block, `Fatal` a human.
+Retrying them would be a busy-wait dressed up as resilience.
+
+**A block the node does not have yet** is not skipped and not hammered. The
+producer waits a poll interval and re-asks for the head — providers behind a
+load balancer disagree by a block or two, and the tip's own view is what has to
+change before the request can succeed.
+
+**Shutdown** races cancellation against both the backoff sleep and the publish,
+so stopping does not wait out a 30-second retry or a full channel. On exit the
+producer drops its sink, which closes the stream and is how the next stage
+learns to finish.
+
 ## The chain boundary
 
 Everything downstream of fetching talks to a `ChainSource` — latest height,

@@ -22,8 +22,13 @@ serde.workspace = true
 figment.workspace = true
 hex.workspace = true
 url.workspace = true
+tokio-util.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
+# Only the tests implement ChainSource by hand (the mock source); the binary
+# itself only ever consumes the trait.
+async-trait.workspace = true
 # `test` brings in figment::Jail, which gives each test its own temporary
 # directory and environment and restores both afterwards — the only safe way to
 # test environment-variable layering, since the environment is process-global.

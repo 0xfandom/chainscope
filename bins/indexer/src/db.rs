@@ -37,6 +37,26 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read the live pipeline's resume point.
+///
+/// `None` means nothing has been processed yet — distinct from `Some(0)`, which
+/// would claim the genesis block was already handled. Advancing this value is
+/// the writer's job (#7) and happens in the same transaction as the rows, which
+/// is what makes a crash resume rather than lose or repeat work.
+pub async fn load_live_cursor(pool: &PgPool) -> anyhow::Result<Option<u64>> {
+    let cursor: Option<i64> = sqlx::query_scalar("SELECT live_cursor FROM chain_state WHERE id = 1")
+        .fetch_one(pool)
+        .await
+        .context("could not read the live cursor")?;
+
+    // Postgres has no unsigned integers, so the column is BIGINT. A negative
+    // value would mean the row was written by something other than this
+    // program, which is worth refusing rather than silently treating as huge.
+    cursor
+        .map(|c| u64::try_from(c).map_err(|_| anyhow::anyhow!("live_cursor is negative: {c}")))
+        .transpose()
+}
+
 /// Create the day partitions the raw event tables will need shortly.
 ///
 /// Called on every startup rather than only at migration time: a process that

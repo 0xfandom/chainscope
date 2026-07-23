@@ -32,6 +32,10 @@ pools = [
 # Where the backfill begins. 0 means "from pool creation".
 start_block = 0
 
+# How often the producer asks for the chain head. Ethereum produces a block
+# every ~12s, so polling much faster just spends RPC quota.
+poll_interval_ms = 4000
+
 # Blocks behind the head before a block is treated as irreversible.
 # ~64 is two Ethereum epochs, which is where Casper FFG finalises.
 finality_depth = 64

@@ -31,6 +31,9 @@ const DEFAULT_FINALITY_DEPTH: u64 = 64; // ~2 epochs on Ethereum
 const DEFAULT_CHANNEL_CAPACITY: usize = 1_024;
 const DEFAULT_BATCH_SIZE: usize = 500;
 const DEFAULT_BACKFILL_CHUNK: u64 = 2_000;
+// Ethereum produces a block every ~12s. Polling faster costs quota for nothing;
+// polling slower adds latency the whole pipeline inherits.
+const DEFAULT_POLL_INTERVAL_MS: u64 = 4_000;
 const DEFAULT_LOG_FILTER: &str = "info";
 
 // ---------------------------------------------------------------------------
@@ -174,6 +177,7 @@ struct RawChain {
     pools: Option<StringList>,
     start_block: Option<u64>,
     finality_depth: Option<u64>,
+    poll_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -217,6 +221,8 @@ pub struct Chain {
     pub pools: Vec<Address>,
     pub start_block: u64,
     pub finality_depth: u64,
+    /// How often the producer asks for the chain head.
+    pub poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +371,11 @@ impl Config {
         let finality_depth = raw.chain.finality_depth.unwrap_or(DEFAULT_FINALITY_DEPTH);
         bound("chain.finality_depth", finality_depth, 1, 100_000)?;
 
+        let poll_interval_ms = raw.chain.poll_interval_ms.unwrap_or(DEFAULT_POLL_INTERVAL_MS);
+        // Below ~250ms this is hammering the provider rather than following the
+        // chain; above five minutes the indexer is not really live.
+        bound("chain.poll_interval_ms", poll_interval_ms, 250, 300_000)?;
+
         // --- pipeline ---
         let transport = match raw.pipeline.transport.as_deref() {
             None => TransportKind::Channel,
@@ -393,6 +404,7 @@ impl Config {
                 pools,
                 start_block,
                 finality_depth,
+                poll_interval_ms,
             },
             pipeline: Pipeline {
                 transport,
@@ -418,7 +430,7 @@ impl Config {
 
         format!(
             "database.url={} max_connections={} | chain_id={} rpc_endpoints=[{}] factory={} pools={} \
-             start_block={} finality_depth={} | transport={} channel_capacity={} batch_size={} backfill_chunk_size={} | log={}",
+             start_block={} finality_depth={} poll_interval_ms={} | transport={} channel_capacity={} batch_size={} backfill_chunk_size={} | log={}",
             redact_url(&self.database.url),
             self.database.max_connections,
             self.chain.chain_id,
@@ -427,6 +439,7 @@ impl Config {
             self.chain.pools.len(),
             self.chain.start_block,
             self.chain.finality_depth,
+            self.chain.poll_interval_ms,
             self.pipeline.transport.as_str(),
             self.pipeline.channel_capacity,
             self.pipeline.batch_size,
@@ -578,6 +591,14 @@ mod tests {
         let err = toml_config(&body).unwrap_err().to_string();
         assert!(err.contains("pipeline.batch_size"), "{err}");
         assert!(err.contains("between 1 and 100000"), "{err}");
+    }
+
+    #[test]
+    fn an_absurd_poll_interval_is_rejected() {
+        let body = format!("{}\npoll_interval_ms = 10\n", valid_toml());
+        let err = toml_config(&body).unwrap_err().to_string();
+        assert!(err.contains("chain.poll_interval_ms"), "{err}");
+        assert!(err.contains("between 250 and 300000"), "{err}");
     }
 
     #[test]
