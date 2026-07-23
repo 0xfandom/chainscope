@@ -6,3 +6,12 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+async-trait.workspace = true
+bigdecimal.workspace = true
+# Only `sync`. This crate needs channels, not a runtime — pulling all of tokio
+# here would drag an executor into a library that should not have an opinion
+# about one.
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }

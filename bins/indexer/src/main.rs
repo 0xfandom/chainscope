@@ -3,6 +3,7 @@
 mod config;
 mod db;
 
+use chainscope_core::{BlockUnit, RowBatch};
 use config::Config;
 
 #[tokio::main]
@@ -29,10 +30,27 @@ async fn main() -> anyhow::Result<()> {
     let created = db::ensure_partitions(&pool).await?;
     tracing::info!(created, "day partitions ensured");
 
+    // The two seams the pipeline runs on. Built here, from configuration, and
+    // nowhere else — a stage receives boxed traits and never learns which
+    // transport it is on. In M5 this same call returns Redpanda-backed
+    // implementations and nothing below it changes.
+    //
+    //   producer --[BlockUnit]--> transformer --[RowBatch]--> writer
+    //
+    // The stages that consume these arrive in #6 and #7; for now building them
+    // proves the wiring type-checks end to end.
+    let (raw_sink, raw_source) =
+        chainscope_core::build_transport::<BlockUnit>(cfg.pipeline.transport, cfg.pipeline.channel_capacity);
+    let (row_sink, row_source) =
+        chainscope_core::build_transport::<RowBatch>(cfg.pipeline.transport, cfg.pipeline.channel_capacity);
+    drop((raw_sink, raw_source, row_sink, row_source));
+
     tracing::info!(
+        transport = cfg.pipeline.transport.as_str(),
+        capacity = cfg.pipeline.channel_capacity,
         pools = cfg.chain.pools.len(),
         chain_id = cfg.chain.chain_id,
-        "schema ready; pipeline not implemented yet"
+        "schema ready; pipeline stages not implemented yet"
     );
     Ok(())
 }
