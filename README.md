@@ -66,6 +66,42 @@ Error: database.url is not set. Set DATABASE_URL in .env, or database.url in cha
 Startup logs a summary of the configuration it ended up with, passwords and API
 keys redacted.
 
+## The chain boundary
+
+Everything downstream of fetching talks to a `ChainSource` — latest height,
+finalized height, one block with its logs, logs over a range, the hash at a
+height. `crates/eth-source` is the only crate that knows Ethereum exists, and
+`cargo tree -p chainscope-core` shows no chain library at all, which is the
+boundary being enforced by the compiler rather than by discipline.
+
+Errors are typed by what the caller should *do*: `Transient` (retry),
+`RangeTooLarge` (bisect and retry smaller), `BlockNotFound` (stop asking),
+`Fatal` (halt). A stringly-typed error would make every call site match on
+message text to decide, which is how a provider rewording something becomes an
+outage.
+
+Only standard JSON-RPC. Provider "enhanced" endpoints are off limits — they are
+another indexer's output, and consuming them would make our input someone
+else's opinion of the chain.
+
+### Free RPC endpoints have very different history limits
+
+Measured 2026-07-23, and it matters more than it looks: live sync only ever
+reads near the tip, but backfill does not.
+
+| Endpoint | `eth_getLogs` history |
+|---|---|
+| `rpc.flashbots.net` | deep, no key — best free option |
+| `eth.drpc.org` | a few thousand blocks |
+| `ethereum-rpc.publicnode.com` | ~128 blocks, then wants a token |
+| `1rpc.io/eth` | caps range width |
+| `eth.llamarpc.com` | returning 521 |
+| `rpc.ankr.com/eth` | now requires a key |
+
+Deep backfill (M3) needs a paid archive endpoint. The network tests avoid fixed
+historical block numbers for this reason — they derive a recent settled block
+from the tip, so they test this code rather than a billing tier.
+
 ## The transport seam
 
 Stages never call each other. Each one publishes to an `EventSink` and reads

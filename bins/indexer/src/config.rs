@@ -39,8 +39,10 @@ const DEFAULT_LOG_FILTER: &str = "info";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    // Boxed because `figment::Error` is 208 bytes, which would otherwise be
+    // the size of every Result in this module — paid on the success path too.
     #[error("could not read configuration: {0}")]
-    Source(#[from] figment::Error),
+    Source(Box<figment::Error>),
 
     #[error("{field} is not set. {hint}")]
     Missing { field: String, hint: String },
@@ -255,7 +257,10 @@ impl Config {
     }
 
     fn from_figment(f: Figment) -> Result<Self, ConfigError> {
-        Self::validate(f.extract::<RawConfig>()?)
+        let raw = f
+            .extract::<RawConfig>()
+            .map_err(|e| ConfigError::Source(Box::new(e)))?;
+        Self::validate(raw)
     }
 
     /// Turn "maybe present, maybe well formed" into "present and well formed".
@@ -612,6 +617,9 @@ mod tests {
         assert!(s.contains("***"), "{s}");
     }
 
+    // The large-Err lint fires on figment::Jail's own closure signature, which
+    // is not ours to change.
+    #[allow(clippy::result_large_err)]
     #[test]
     fn environment_overrides_the_file() {
         figment::Jail::expect_with(|jail| {
@@ -626,6 +634,7 @@ mod tests {
         });
     }
 
+    #[allow(clippy::result_large_err)]
     #[test]
     fn database_url_env_var_is_honoured_without_a_prefix() {
         figment::Jail::expect_with(|jail| {

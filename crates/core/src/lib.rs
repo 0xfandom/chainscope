@@ -5,9 +5,11 @@
 //! `alloy` ever appears in this crate's dependency list, the boundary has been
 //! crossed and a second chain becomes a rewrite instead of a new impl.
 
+pub mod source;
 pub mod transport;
 pub mod types;
 
+pub use source::{ChainSource, SourceError};
 pub use transport::{
     build as build_transport, channel, ChannelSink, ChannelSource, Delivery, EventSink,
     EventSource, Receipt, TransportError, TransportKind,
