@@ -2,10 +2,14 @@
 
 mod config;
 mod db;
+mod producer;
 
-use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
+use std::{sync::Arc, time::Duration};
+
+use chainscope_core::{source::ChainSource, BlockUnit, EventSource, RowBatch};
 use chainscope_eth_source::EthSource;
 use config::Config;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,13 +27,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(config = %cfg.summary(), "configuration loaded");
 
     let pool = db::connect(&cfg.database).await?;
-    tracing::info!("connected to postgres");
-
     db::migrate(&pool).await?;
-    tracing::info!("migrations up to date");
-
     let created = db::ensure_partitions(&pool).await?;
-    tracing::info!(created, "day partitions ensured");
+    tracing::info!(created, "database ready");
 
     // The two seams the pipeline runs on. Built here, from configuration, and
     // nowhere else — a stage receives boxed traits and never learns which
@@ -37,19 +37,16 @@ async fn main() -> anyhow::Result<()> {
     // implementations and nothing below it changes.
     //
     //   producer --[BlockUnit]--> transformer --[RowBatch]--> writer
-    //
-    // The stages that consume these arrive in #6 and #7; for now building them
-    // proves the wiring type-checks end to end.
-    let (raw_sink, raw_source) =
-        chainscope_core::build_transport::<BlockUnit>(cfg.pipeline.transport, cfg.pipeline.channel_capacity);
-    let (row_sink, row_source) =
-        chainscope_core::build_transport::<RowBatch>(cfg.pipeline.transport, cfg.pipeline.channel_capacity);
-    drop((raw_sink, raw_source, row_sink, row_source));
+    let (raw_sink, raw_source) = chainscope_core::build_transport::<BlockUnit>(
+        cfg.pipeline.transport,
+        cfg.pipeline.channel_capacity,
+    );
+    let (row_sink, row_source) = chainscope_core::build_transport::<RowBatch>(
+        cfg.pipeline.transport,
+        cfg.pipeline.channel_capacity,
+    );
+    drop((row_sink, row_source)); // the transformer and writer arrive in #7
 
-    // Reach the chain once before claiming to be ready. An indexer that cannot
-    // read the chain has nothing to do, so finding out now — with a clear
-    // message — beats discovering it inside a retry loop later.
-    //
     // Only the first endpoint is used. The failover pool across all configured
     // endpoints is M3; the trait it hides behind already exists.
     let watched: Vec<_> = cfg
@@ -59,8 +56,12 @@ async fn main() -> anyhow::Result<()> {
         .map(|a| a.0)
         .chain(std::iter::once(cfg.chain.factory.0))
         .collect();
-    let source = EthSource::new(&cfg.chain.rpc_endpoints[0], &watched);
+    let source: Arc<dyn ChainSource> =
+        Arc::new(EthSource::new(&cfg.chain.rpc_endpoints[0], &watched));
 
+    // Reach the chain once before claiming to be ready. An indexer that cannot
+    // read the chain has nothing to do, so finding out now — with a clear
+    // message — beats discovering it inside a retry loop later.
     let tip = source.latest_block().await?;
     let finalized = source.finalized_block().await?;
     tracing::info!(
@@ -71,14 +72,55 @@ async fn main() -> anyhow::Result<()> {
         "chain reachable"
     );
 
-    tracing::info!(
-        transport = cfg.pipeline.transport.as_str(),
-        capacity = cfg.pipeline.channel_capacity,
-        pools = cfg.chain.pools.len(),
-        chain_id = cfg.chain.chain_id,
-        "schema ready; pipeline stages not implemented yet"
+    let cursor = db::load_live_cursor(&pool).await?;
+    tracing::info!(?cursor, "live cursor loaded");
+
+    let cancel = CancellationToken::new();
+
+    let producer = producer::Producer::new(
+        Arc::clone(&source),
+        raw_sink,
+        cursor,
+        cfg.chain.start_block,
+        Duration::from_millis(cfg.chain.poll_interval_ms),
+        cancel.clone(),
     );
+    let producer_task = tokio::spawn(producer.run());
+
+    // A placeholder consumer so the pipeline runs end to end. It logs and
+    // discards, and critically it does NOT advance the cursor — that belongs in
+    // the same transaction as the rows, which is #7. Advancing it here would
+    // fake durability and let a crash lose blocks silently.
+    let drain_task = tokio::spawn(drain(raw_source));
+
+    // Proper supervision — join set, shutdown ordering, failure propagation —
+    // is #8. This is the minimum that makes Ctrl-C behave.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("interrupt received, shutting down"),
+        r = producer_task => { r??; tracing::info!("producer finished"); }
+    }
+    cancel.cancel();
+    let _ = drain_task.await;
+
     Ok(())
+}
+
+/// Stand-in for the transformer and writer.
+async fn drain(mut source: Box<dyn EventSource<BlockUnit>>) {
+    let mut count = 0u64;
+    while let Ok(Some(delivery)) = source.recv().await {
+        let unit = delivery.payload;
+        count += 1;
+        tracing::info!(
+            number = unit.number,
+            hash = %hex::encode(&unit.hash[..8]),
+            logs = unit.logs.len(),
+            seen = count,
+            "block received (not yet written — see #7)"
+        );
+        let _ = source.ack(delivery.receipt).await;
+    }
+    tracing::info!(count, "stream ended");
 }
 
 /// RUST_LOG wins over the config file, so a running process can be made verbose
