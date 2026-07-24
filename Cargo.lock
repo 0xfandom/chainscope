@@ -1207,6 +1207,7 @@ version = "0.0.0"
 dependencies = [
  "alloy",
  "async-trait",
+ "bigdecimal",
  "chainscope-core",
  "hex",
  "tokio",
