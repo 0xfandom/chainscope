@@ -2,3 +2,6 @@
 **/*.rs.bk
 .env
 .DS_Store
+
+# Private learning notes and milestone write-ups. Not for the public repo.
+/notes/
