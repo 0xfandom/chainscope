@@ -27,13 +27,29 @@ use std::{
     time::Duration,
 };
 
-use chainscope_core::{source::ChainSource, BlockUnit};
-use chainscope_indexer::{consumer::Writer, db, producer::Producer, testkit::SyntheticChain};
+use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
+use chainscope_indexer::{
+    consumer::Writer, db, producer::Producer, testkit::SyntheticChain, transformer::Transformer,
+};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tokio_util::sync::CancellationToken;
 
 const HEIGHT: u64 = 150;
+
+/// A `BlockUnit` as the writer now sees it: a `RowBatch` carrying only the block
+/// header, no decoded rows. The synthetic chain produces no watched logs, so
+/// this is what the transformer would emit for every block.
+fn empty_row_batch(b: &BlockUnit) -> RowBatch {
+    RowBatch {
+        block_number: b.number,
+        block_hash: b.hash,
+        parent_hash: b.parent_hash,
+        block_time: b.timestamp,
+        swaps: vec![],
+        liq_events: vec![],
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Ephemeral database plumbing
@@ -155,33 +171,45 @@ async fn cursor(pool: &PgPool) -> u64 {
 async fn run_then_kill(pool: &PgPool, kill_after: Duration) {
     let resume = db::load_live_cursor(pool).await.unwrap();
 
-    let (sink, source) =
+    // The full three-stage pipeline, as it runs in production:
+    //   producer --BlockUnit--> transformer --RowBatch--> writer
+    let (raw_sink, raw_source) =
         chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportKind::Channel, 32);
+    let (row_sink, row_source) =
+        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 32);
 
     let chain: Arc<dyn ChainSource> = Arc::new(SyntheticChain::new(HEIGHT));
     let producer = Producer::new(
         chain,
-        sink,
+        raw_sink,
         resume,
         1, // configured_start: with no cursor, begin at block 1, not the head
         Duration::from_millis(1),
         CancellationToken::new(),
     );
+    // Empty watched set: the synthetic chain's logs are not from any watched
+    // pool, so every RowBatch is empty. That is exactly what this test wants —
+    // it proves the block-level exactly-once invariant, which decoded rows ride
+    // on; the row-level no-double-count proof is in #25.
+    let transformer = Transformer::new(raw_source, row_sink, Vec::<[u8; 20]>::new());
     // Small batches and a short flush so a randomised kill frequently lands
     // mid-batch, which is the case that matters most.
-    let writer = Writer::new(pool.clone(), source, 8, Duration::from_millis(4));
+    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(4));
 
     let ph = tokio::spawn(producer.run());
+    let th = tokio::spawn(transformer.run());
     let wh = tokio::spawn(writer.run());
 
     tokio::time::sleep(kill_after).await;
 
     ph.abort();
+    th.abort();
     wh.abort();
     // Awaiting the aborted handles guarantees their futures — and the sqlx
     // transaction one of them may hold — have been dropped before the next
     // segment reuses the pool.
     let _ = ph.await;
+    let _ = th.await;
     let _ = wh.await;
 }
 
@@ -271,8 +299,8 @@ async fn a_cursor_ahead_of_the_rows_is_detected() {
 
     // Write blocks 1..=5 the correct, atomic way. The invariant holds.
     let chain = SyntheticChain::new(HEIGHT);
-    let batch: Vec<_> = (1..=5).map(|n| chain.unit(n)).collect();
-    db::write_block_batch(&pool, &batch, false).await.unwrap();
+    let batch: Vec<_> = (1..=5).map(|n| empty_row_batch(&chain.unit(n))).collect();
+    db::write_row_batches(&pool, &batch, false).await.unwrap();
     check_consistency(&pool)
         .await
         .expect("a clean atomic write must be consistent");

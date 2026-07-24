@@ -17,13 +17,13 @@
 
 use std::time::{Duration, Instant};
 
-use chainscope_core::{BlockUnit, EventSource, Receipt};
+use chainscope_core::{EventSource, Receipt, RowBatch};
 use sqlx::postgres::PgPool;
 use tokio::time::sleep;
 
 pub struct Writer {
     pool: PgPool,
-    source: Box<dyn EventSource<BlockUnit>>,
+    source: Box<dyn EventSource<RowBatch>>,
     max_batch: usize,
     flush_interval: Duration,
 }
@@ -39,7 +39,7 @@ enum BatchEnd {
 impl Writer {
     pub fn new(
         pool: PgPool,
-        source: Box<dyn EventSource<BlockUnit>>,
+        source: Box<dyn EventSource<RowBatch>>,
         max_batch: usize,
         flush_interval: Duration,
     ) -> Self {
@@ -60,19 +60,19 @@ impl Writer {
         let mut total: u64 = 0;
 
         loop {
-            let mut batch: Vec<BlockUnit> = Vec::with_capacity(self.max_batch);
+            let mut batch: Vec<RowBatch> = Vec::with_capacity(self.max_batch);
             let mut last_receipt: Option<Receipt> = None;
             let end = self.collect(&mut batch, &mut last_receipt).await?;
 
             if !batch.is_empty() {
-                let first = batch.first().map(|b| b.number);
-                let last = batch.last().map(|b| b.number);
+                let first = batch.first().map(|b| b.block_number);
+                let last = batch.last().map(|b| b.block_number);
 
                 // Timed so #10 can turn this into a histogram; for now the
                 // duration rides on the flush log line. A real metrics backend
                 // is M10, not a reason to hold up the write path.
                 let started = Instant::now();
-                let written = crate::db::write_block_batch(&self.pool, &batch, false).await?;
+                let written = crate::db::write_row_batches(&self.pool, &batch, false).await?;
                 let elapsed = started.elapsed();
                 total += written;
 
@@ -111,7 +111,7 @@ impl Writer {
     /// empty batches on a timer — it simply waits for a block.
     async fn collect(
         &mut self,
-        batch: &mut Vec<BlockUnit>,
+        batch: &mut Vec<RowBatch>,
         last_receipt: &mut Option<Receipt>,
     ) -> anyhow::Result<BatchEnd> {
         // Block until the first item. Nothing to flush until something arrives,
@@ -159,23 +159,24 @@ mod tests {
     use super::*;
     use chainscope_core::{types::Hash32, EventSink};
 
-    fn block(n: u64) -> BlockUnit {
+    fn block(n: u64) -> RowBatch {
         let mut h: Hash32 = [0u8; 32];
         h[..8].copy_from_slice(&n.to_be_bytes());
-        BlockUnit {
-            number: n,
-            hash: h,
+        RowBatch {
+            block_number: n,
+            block_hash: h,
             parent_hash: [0u8; 32],
-            timestamp: 1_700_000_000 + n as i64,
-            logs: vec![],
+            block_time: 1_700_000_000 + n as i64,
+            swaps: vec![],
+            liq_events: vec![],
         }
     }
 
     /// A writer whose `collect` we drive without a database. The pool is created
     /// lazily and never connected, because `collect` never touches it.
-    fn collector(max_batch: usize, flush: Duration) -> (Box<dyn EventSink<BlockUnit>>, Writer) {
+    fn collector(max_batch: usize, flush: Duration) -> (Box<dyn EventSink<RowBatch>>, Writer) {
         let (sink, source) =
-            chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportKind::Channel, 256);
+            chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 256);
         let pool = PgPool::connect_lazy("postgres://unused").unwrap();
         (sink, Writer::new(pool, source, max_batch, flush))
     }
@@ -192,7 +193,7 @@ mod tests {
         let end = w.collect(&mut batch, &mut r).await.unwrap();
 
         assert!(matches!(end, BatchEnd::Full));
-        assert_eq!(batch.iter().map(|b| b.number).collect::<Vec<_>>(), vec![100, 101, 102]);
+        assert_eq!(batch.iter().map(|b| b.block_number).collect::<Vec<_>>(), vec![100, 101, 102]);
         assert!(r.is_some(), "the last receipt must be captured for acking");
     }
 
