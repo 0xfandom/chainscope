@@ -35,3 +35,6 @@ async-trait.workspace = true
 # directory and environment and restores both afterwards — the only safe way to
 # test environment-variable layering, since the environment is process-global.
 figment = { version = "0.10", features = ["toml", "env", "test"] }
+# The writer_db integration test builds SwapRow values, whose NUMERIC amounts
+# are BigDecimal.
+bigdecimal.workspace = true

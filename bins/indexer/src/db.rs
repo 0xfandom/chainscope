@@ -11,7 +11,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Postgres;
 
 use crate::config::Database;
-use chainscope_core::BlockUnit;
+use chainscope_core::{LiqRow, RowBatch, SwapRow};
 
 /// Migrations live at the workspace root, not inside this crate, because the
 /// API binary and any operator running `sqlx migrate` by hand need the same set.
@@ -59,49 +59,59 @@ pub async fn load_live_cursor(pool: &PgPool) -> anyhow::Result<Option<u64>> {
         .transpose()
 }
 
-/// Write one batch of blocks and advance the cursor, atomically.
+/// Write a batch of decoded blocks and advance the cursor, atomically.
 ///
 /// This is the transaction where the project's exactly-once guarantee is
-/// manufactured. The block rows and the cursor move together inside a single
-/// `BEGIN`/`COMMIT`, so a crash can only ever leave the database in one of two
-/// states: the whole batch is present and the cursor names its last block, or
-/// none of it is and the cursor is unchanged. There is no third state where the
-/// cursor claims progress the rows do not back up.
+/// manufactured. Each block's header, its swap rows, its liquidity-event rows,
+/// and the cursor advance move together inside a single `BEGIN`/`COMMIT`, so a
+/// crash can only ever leave the database in one of two states: the whole batch
+/// is present and the cursor names its last block, or none of it is and the
+/// cursor is unchanged. There is no third state — no swap without its block, no
+/// cursor ahead of the rows it claims.
 ///
-/// Idempotency comes from two places working together. `ON CONFLICT (number) DO
-/// NOTHING` means replaying a block inserts nothing, and the cursor moves with
-/// `GREATEST`, so replaying an old range can never drag it backwards. Together
-/// they make replaying any range a no-op, which is what lets crash recovery be
+/// Idempotency comes from `ON CONFLICT DO NOTHING` on every table's natural key
+/// plus a cursor that only moves forward (`GREATEST`). Replaying a block inserts
+/// nothing and cannot drag the cursor back, which is what lets crash recovery be
 /// "rewind the cursor and rerun" without special cases.
 ///
-/// `fail_before_commit` exists only for tests: it forces the transaction to be
-/// dropped after all the work but before `COMMIT`, so a test can assert that the
-/// rows and the cursor roll back together. In normal use it is always false.
+/// A `RowBatch` with no swaps and no liq_events is still written: its block
+/// header lands and the cursor advances, so a quiet block is not re-scanned
+/// forever.
 ///
-/// M2 extends this same function to also insert decoded swaps and liq_events,
-/// and M6 to update wallet PnL — all inside this transaction, because that is
-/// the only place they can be made idempotent alongside the cursor. The rows
-/// they derive from must be the ones that actually inserted here (via
-/// `RETURNING`), never the incoming batch, or a replay would double-count.
-pub async fn write_block_batch(
+/// `fail_before_commit` exists only for tests: it drops the transaction after
+/// all the work but before `COMMIT`, so a test can assert rows and cursor roll
+/// back together. In normal use it is always false.
+///
+/// M6 extends this same transaction to update wallet PnL, for the same reason
+/// the rows are here: it is the only place derived state can be made idempotent
+/// alongside the cursor. Anything derived must come from the rows that *actually
+/// inserted* (via `RETURNING`), never the incoming batch, or a replay would
+/// double-count.
+pub async fn write_row_batches(
     pool: &PgPool,
-    blocks: &[BlockUnit],
+    batches: &[RowBatch],
     fail_before_commit: bool,
 ) -> anyhow::Result<u64> {
-    if blocks.is_empty() {
+    if batches.is_empty() {
         return Ok(0);
     }
 
     let mut tx = pool.begin().await.context("could not open write transaction")?;
 
-    for b in blocks {
+    for b in batches {
         insert_block(&mut tx, b).await?;
+        for s in &b.swaps {
+            insert_swap(&mut tx, b, s).await?;
+        }
+        for l in &b.liq_events {
+            insert_liq(&mut tx, b, l).await?;
+        }
     }
 
     // The producer is sequential and in order, so the last block is the highest.
     // GREATEST is defensive: even a mis-ordered batch can only move the cursor
     // forward, never back.
-    let high = blocks.iter().map(|b| b.number).max().unwrap() as i64;
+    let high = batches.iter().map(|b| b.block_number).max().unwrap() as i64;
     sqlx::query(
         "UPDATE chain_state
             SET live_cursor = GREATEST(COALESCE(live_cursor, -1), $1),
@@ -122,27 +132,90 @@ pub async fn write_block_batch(
     }
 
     tx.commit().await.context("could not commit the write transaction")?;
-    Ok(blocks.len() as u64)
+    Ok(batches.len() as u64)
 }
 
 async fn insert_block(
     tx: &mut sqlx::Transaction<'_, Postgres>,
-    b: &BlockUnit,
+    b: &RowBatch,
 ) -> anyhow::Result<()> {
-    // Per-row inserts for now. Bulk COPY is M3; at M1 batch sizes the difference
-    // is noise, and correctness is the only thing this milestone is proving.
+    // Per-row inserts for now. Bulk COPY is M3; at these batch sizes the
+    // difference is noise, and correctness is the only thing M1/M2 are proving.
     sqlx::query(
         "INSERT INTO blocks (number, block_hash, parent_hash, block_time)
          VALUES ($1, $2, $3, to_timestamp($4))
          ON CONFLICT (number) DO NOTHING",
     )
-    .bind(b.number as i64)
-    .bind(b.hash.as_slice())
+    .bind(b.block_number as i64)
+    .bind(b.block_hash.as_slice())
     .bind(b.parent_hash.as_slice())
-    .bind(b.timestamp)
+    .bind(b.block_time)
     .execute(&mut **tx)
     .await
-    .with_context(|| format!("could not insert block {}", b.number))?;
+    .with_context(|| format!("could not insert block {}", b.block_number))?;
+    Ok(())
+}
+
+async fn insert_swap(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    b: &RowBatch,
+    s: &SwapRow,
+) -> anyhow::Result<()> {
+    // block_time and block_number come from the block, not the row: block_time
+    // is the partition key, and it must match the value the block header used so
+    // the conflict on `(block_time, tx_hash, log_index)` fires on replay.
+    sqlx::query(
+        "INSERT INTO swaps
+            (block_time, tx_hash, log_index, block_number, pool, sender, recipient,
+             amount0, amount1, sqrt_price_x96, liquidity, tick)
+         VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
+    )
+    .bind(b.block_time)
+    .bind(s.tx_hash.as_slice())
+    .bind(s.log_index as i32)
+    .bind(b.block_number as i64)
+    .bind(s.pool.as_slice())
+    .bind(s.sender.as_slice())
+    .bind(s.recipient.as_slice())
+    .bind(s.amount0.clone())
+    .bind(s.amount1.clone())
+    .bind(s.sqrt_price_x96.clone())
+    .bind(s.liquidity.clone())
+    .bind(s.tick)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("could not insert swap at block {}", b.block_number))?;
+    Ok(())
+}
+
+async fn insert_liq(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    b: &RowBatch,
+    l: &LiqRow,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO liq_events
+            (block_time, tx_hash, log_index, block_number, pool, kind, owner,
+             tick_lower, tick_upper, amount, amount0, amount1)
+         VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
+    )
+    .bind(b.block_time)
+    .bind(l.tx_hash.as_slice())
+    .bind(l.log_index as i32)
+    .bind(b.block_number as i64)
+    .bind(l.pool.as_slice())
+    .bind(l.kind.as_str())
+    .bind(l.owner.as_slice())
+    .bind(l.tick_lower)
+    .bind(l.tick_upper)
+    .bind(l.amount.clone())
+    .bind(l.amount0.clone())
+    .bind(l.amount1.clone())
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("could not insert liq_event at block {}", b.block_number))?;
     Ok(())
 }
 

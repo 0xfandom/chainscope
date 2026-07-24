@@ -8,6 +8,7 @@ use chainscope_indexer::{
     config::Config,
     consumer, db, producer,
     supervisor::{self, Shutdown, Supervisor},
+    transformer,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +46,6 @@ async fn main() -> anyhow::Result<ExitCode> {
         cfg.pipeline.transport,
         cfg.pipeline.channel_capacity,
     );
-    drop((row_sink, row_source)); // the transformer and writer arrive in #7
 
     // Only the first endpoint is used. The failover pool across all configured
     // endpoints is M3; the trait it hides behind already exists.
@@ -85,27 +85,34 @@ async fn main() -> anyhow::Result<ExitCode> {
         Duration::from_millis(cfg.chain.poll_interval_ms),
         cancel.clone(),
     );
-    // The writer drains blocks and commits them with the cursor, one
-    // transaction per batch. In M1 it consumes BlockUnit directly and writes the
-    // blocks table; M2 inserts a transformer ahead of it and the writer moves to
-    // RowBatch, extending the same transaction with decoded rows.
+    // The transformer sits between: it decodes each block's watched logs into a
+    // RowBatch. It watches the same contracts the source fetches for — the pools
+    // plus the factory — so a pool event decodes and a factory PoolCreated is
+    // recognised (though not stored until M7).
+    let transformer = transformer::Transformer::new(raw_source, row_sink, watched.clone());
+
+    // The writer drains decoded batches and commits each with the cursor, one
+    // transaction per batch — the block header, its swaps, its liq_events, and
+    // the cursor advance all together, which is where exactly-once lives.
     let writer = consumer::Writer::new(
         pool.clone(),
-        raw_source,
+        row_source,
         cfg.pipeline.batch_size,
         Duration::from_millis(cfg.pipeline.flush_interval_ms),
     );
 
     // Every stage runs under one supervisor sharing one cancellation token.
     // Shutdown order is not scripted here: tripping the token makes the producer
-    // stop and drop its sink, that closure closes the stream, and the writer
-    // drains and commits its final batch before returning. The signal handler is
-    // just another supervised task that trips the token.
+    // stop and drop its sink; that closes the stream into the transformer, which
+    // drains, finishes, and drops its own sink; that closes the stream into the
+    // writer, which drains and commits its final batch before returning. The
+    // signal handler is just another supervised task that trips the token.
     let mut sup = Supervisor::new(
         cancel.clone(),
         Duration::from_millis(cfg.pipeline.shutdown_timeout_ms),
     );
     sup.spawn("producer", producer.run());
+    sup.spawn("transformer", transformer.run());
     sup.spawn("writer", writer.run());
     sup.spawn("signals", {
         let cancel = cancel.clone();
