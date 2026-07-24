@@ -12,8 +12,10 @@
 //! rather than the chain itself, and would silently tie correctness to a vendor.
 
 pub mod decode;
+pub mod rows;
 
 pub use decode::{decode, DecodedEvent};
+pub use rows::{map_log, Mapped};
 
 use alloy::{
     eips::BlockNumberOrTag,
