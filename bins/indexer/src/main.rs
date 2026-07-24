@@ -1,17 +1,14 @@
-//! chainscope ingestion pipeline.
-
-mod config;
-mod consumer;
-mod db;
-mod producer;
-mod supervisor;
+//! chainscope ingestion pipeline — binary entry point over the library.
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
 use chainscope_eth_source::EthSource;
-use config::Config;
-use supervisor::{Shutdown, Supervisor};
+use chainscope_indexer::{
+    config::Config,
+    consumer, db, producer,
+    supervisor::{self, Shutdown, Supervisor},
+};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]

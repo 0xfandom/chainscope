@@ -66,6 +66,35 @@ Error: database.url is not set. Set DATABASE_URL in .env, or database.url in cha
 Startup logs a summary of the configuration it ended up with, passwords and API
 keys redacted.
 
+## Crash resumability — the M1 exit criterion
+
+M1's promise is behavioural: kill the indexer at any moment and it resumes
+correctly. `tests/crash_resumability.rs` makes that a repeatable test rather than
+a one-off manual check. It runs the real producer and writer against a
+deterministic synthetic chain, aborts the tasks at a randomised point — the
+in-process equivalent of `kill -9`, since an uncommitted transaction is simply
+dropped — restarts from the stored cursor, and repeats until the whole chain is
+stored. After every restart it asserts the invariant: blocks form a gap-free run
+from 1, no duplicates, and the cursor never runs ahead of the rows. Fifty
+randomised trials, all converging.
+
+The last criterion is the one that matters: a test that cannot fail proves
+nothing. A companion test deliberately breaks atomicity — advances the cursor
+without the rows, exactly what a non-atomic writer would leave on a crash — and
+asserts the invariant catches it (`cursor N exceeds the highest stored block`).
+
+Writing this harness surfaced a subtle bug in the harness itself, worth
+recording: the consistency check first read the blocks and the cursor in two
+separate statements. Under `READ COMMITTED` each statement takes its own
+snapshot, so a concurrently-landing atomic commit fell between the two reads and
+made a perfectly consistent database look broken. The write was always atomic;
+the check now reads both in one snapshot. The fix was in the test, not the
+pipeline — but only running it revealed that.
+
+The synthetic chain lives in `testkit` with a `branch` byte folded into every
+hash, unused in M1 — the hook M4's reorg tests will use to produce an alternate
+branch above a fork point.
+
 ## Supervision and shutdown
 
 Every stage — producer, writer, signal handler — runs as a task in one
