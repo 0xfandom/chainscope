@@ -97,6 +97,7 @@ checksum = "e8421a5ee9019b6d89f92935d0f8facd9f6ca088b41d7cc47244a02ccde4545f"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-sol-types",
 ]
 
 [[package]]
@@ -1207,6 +1208,7 @@ dependencies = [
  "alloy",
  "async-trait",
  "chainscope-core",
+ "hex",
  "tokio",
  "tracing",
  "url",

@@ -45,4 +45,5 @@ alloy = { version = "2", default-features = false, features = [
     "transport-http",
     "reqwest-rustls-tls",
     "json-rpc",
+    "sol-types",
 ] }

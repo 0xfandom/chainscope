@@ -11,6 +11,10 @@
 //! — consuming them would make our input someone else's opinion of the chain
 //! rather than the chain itself, and would silently tie correctness to a vendor.
 
+pub mod decode;
+
+pub use decode::{decode, DecodedEvent};
+
 use alloy::{
     eips::BlockNumberOrTag,
     primitives::Address,
