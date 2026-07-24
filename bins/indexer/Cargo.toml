@@ -38,3 +38,6 @@ figment = { version = "0.10", features = ["toml", "env", "test"] }
 # The writer_db integration test builds SwapRow values, whose NUMERIC amounts
 # are BigDecimal.
 bigdecimal.workspace = true
+# The live_pipeline test builds an EthSource against a real RPC URL and creates
+# ephemeral databases.
+url.workspace = true
