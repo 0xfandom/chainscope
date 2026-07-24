@@ -1,12 +1,13 @@
 //! chainscope ingestion pipeline.
 
 mod config;
+mod consumer;
 mod db;
 mod producer;
 
 use std::{sync::Arc, time::Duration};
 
-use chainscope_core::{source::ChainSource, BlockUnit, EventSource, RowBatch};
+use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
 use chainscope_eth_source::EthSource;
 use config::Config;
 use tokio_util::sync::CancellationToken;
@@ -87,40 +88,33 @@ async fn main() -> anyhow::Result<()> {
     );
     let producer_task = tokio::spawn(producer.run());
 
-    // A placeholder consumer so the pipeline runs end to end. It logs and
-    // discards, and critically it does NOT advance the cursor — that belongs in
-    // the same transaction as the rows, which is #7. Advancing it here would
-    // fake durability and let a crash lose blocks silently.
-    let drain_task = tokio::spawn(drain(raw_source));
+    // The writer drains blocks and commits them with the cursor, one
+    // transaction per batch. In M1 it consumes BlockUnit directly and writes the
+    // blocks table; M2 inserts a transformer ahead of it and the writer moves to
+    // RowBatch, extending the same transaction with decoded rows.
+    let writer = consumer::Writer::new(
+        pool.clone(),
+        raw_source,
+        cfg.pipeline.batch_size,
+        Duration::from_millis(cfg.pipeline.flush_interval_ms),
+    );
+    let writer_task = tokio::spawn(writer.run());
 
     // Proper supervision — join set, shutdown ordering, failure propagation —
-    // is #8. This is the minimum that makes Ctrl-C behave.
+    // is #8. This is the minimum that makes Ctrl-C behave: signal cancellation,
+    // let the producer stop and close the seam, let the writer flush its last
+    // batch (cursor included) and exit.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => tracing::info!("interrupt received, shutting down"),
         r = producer_task => { r??; tracing::info!("producer finished"); }
     }
     cancel.cancel();
-    let _ = drain_task.await;
+    if let Err(e) = writer_task.await? {
+        tracing::error!(error = %e, "writer failed");
+        return Err(e);
+    }
 
     Ok(())
-}
-
-/// Stand-in for the transformer and writer.
-async fn drain(mut source: Box<dyn EventSource<BlockUnit>>) {
-    let mut count = 0u64;
-    while let Ok(Some(delivery)) = source.recv().await {
-        let unit = delivery.payload;
-        count += 1;
-        tracing::info!(
-            number = unit.number,
-            hash = %hex::encode(&unit.hash[..8]),
-            logs = unit.logs.len(),
-            seen = count,
-            "block received (not yet written — see #7)"
-        );
-        let _ = source.ack(delivery.receipt).await;
-    }
-    tracing::info!(count, "stream ended");
 }
 
 /// RUST_LOG wins over the config file, so a running process can be made verbose

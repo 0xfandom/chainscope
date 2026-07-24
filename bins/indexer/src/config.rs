@@ -30,6 +30,11 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 const DEFAULT_FINALITY_DEPTH: u64 = 64; // ~2 epochs on Ethereum
 const DEFAULT_CHANNEL_CAPACITY: usize = 1_024;
 const DEFAULT_BATCH_SIZE: usize = 500;
+// A batch flushes when it reaches batch_size OR this long has passed since its
+// first block, whichever comes first. The timeout bounds latency when blocks
+// trickle in slower than a full batch — otherwise a quiet chain would hold the
+// last few blocks unwritten indefinitely.
+const DEFAULT_FLUSH_INTERVAL_MS: u64 = 2_000;
 const DEFAULT_BACKFILL_CHUNK: u64 = 2_000;
 // Ethereum produces a block every ~12s. Polling faster costs quota for nothing;
 // polling slower adds latency the whole pipeline inherits.
@@ -186,6 +191,7 @@ struct RawPipeline {
     transport: Option<String>,
     channel_capacity: Option<usize>,
     batch_size: Option<usize>,
+    flush_interval_ms: Option<u64>,
     backfill_chunk_size: Option<u64>,
 }
 
@@ -232,6 +238,8 @@ pub struct Pipeline {
     pub transport: TransportKind,
     pub channel_capacity: usize,
     pub batch_size: usize,
+    /// Upper bound on how long a partial batch waits before being written.
+    pub flush_interval_ms: u64,
     pub backfill_chunk_size: u64,
 }
 
@@ -389,6 +397,9 @@ impl Config {
         let batch_size = raw.pipeline.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
         bound("pipeline.batch_size", batch_size as u64, 1, 100_000)?;
 
+        let flush_interval_ms = raw.pipeline.flush_interval_ms.unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
+        bound("pipeline.flush_interval_ms", flush_interval_ms, 50, 60_000)?;
+
         let backfill_chunk_size = raw.pipeline.backfill_chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK);
         bound("pipeline.backfill_chunk_size", backfill_chunk_size, 1, 100_000)?;
 
@@ -410,6 +421,7 @@ impl Config {
                 transport,
                 channel_capacity,
                 batch_size,
+                flush_interval_ms,
                 backfill_chunk_size,
             },
             log: Log { filter },
@@ -430,7 +442,7 @@ impl Config {
 
         format!(
             "database.url={} max_connections={} | chain_id={} rpc_endpoints=[{}] factory={} pools={} \
-             start_block={} finality_depth={} poll_interval_ms={} | transport={} channel_capacity={} batch_size={} backfill_chunk_size={} | log={}",
+             start_block={} finality_depth={} poll_interval_ms={} | transport={} channel_capacity={} batch_size={} flush_interval_ms={} backfill_chunk_size={} | log={}",
             redact_url(&self.database.url),
             self.database.max_connections,
             self.chain.chain_id,
@@ -443,6 +455,7 @@ impl Config {
             self.pipeline.transport.as_str(),
             self.pipeline.channel_capacity,
             self.pipeline.batch_size,
+            self.pipeline.flush_interval_ms,
             self.pipeline.backfill_chunk_size,
             self.log.filter,
         )

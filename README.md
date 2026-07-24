@@ -66,6 +66,33 @@ Error: database.url is not set. Set DATABASE_URL in .env, or database.url in cha
 Startup logs a summary of the configuration it ended up with, passwords and API
 keys redacted.
 
+## The writer, and exactly-once
+
+The writer drains blocks from the seam, gathers them into batches, and commits
+each batch in **one transaction that also advances the cursor**. That single
+transaction is where exactly-once is manufactured: a crash can only ever leave
+the database in one of two states — the whole batch is present and the cursor
+names its last block, or none of it is and the cursor is unchanged. There is no
+state where the cursor claims progress the rows do not back up.
+
+Replaying any range is a no-op, from two things working together: block inserts
+use `ON CONFLICT (number) DO NOTHING`, and the cursor only ever moves forward
+via `GREATEST`. That is what lets crash recovery be "resume from the cursor and
+rerun" with no special cases — the re-fetched blocks simply conflict away.
+
+Batching is only for throughput; one transaction per block would be correct but
+slow. A batch flushes at `batch_size` or after `flush_interval_ms`, whichever
+comes first, so a quiet chain never holds the last few blocks unwritten. The
+cursor is advanced *only* inside that transaction, never anywhere else.
+
+When decoding (M2) and PnL (M6) arrive, they extend this same transaction, and
+must derive from the rows that actually inserted here (via `RETURNING`), not the
+incoming batch — otherwise a replay would double-count.
+
+In M1 the writer consumes `BlockUnit` directly and writes the `blocks` table.
+M2 inserts a transformer ahead of it; the writer then consumes `RowBatch` and
+the same transaction gains the decoded rows.
+
 ## The producer
 
 The first stage. It reads the live cursor, walks forward one block at a time,
