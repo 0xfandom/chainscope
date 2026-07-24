@@ -12,3 +12,4 @@ pub mod db;
 pub mod producer;
 pub mod supervisor;
 pub mod testkit;
+pub mod transformer;
