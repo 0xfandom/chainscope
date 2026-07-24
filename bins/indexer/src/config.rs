@@ -39,6 +39,10 @@ const DEFAULT_BACKFILL_CHUNK: u64 = 2_000;
 // Ethereum produces a block every ~12s. Polling faster costs quota for nothing;
 // polling slower adds latency the whole pipeline inherits.
 const DEFAULT_POLL_INTERVAL_MS: u64 = 4_000;
+// How long shutdown waits for stages to wind down before aborting. Generous,
+// because the writer may be mid-commit when the signal lands and a killed
+// commit just replays next start.
+const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_LOG_FILTER: &str = "info";
 
 // ---------------------------------------------------------------------------
@@ -193,6 +197,7 @@ struct RawPipeline {
     batch_size: Option<usize>,
     flush_interval_ms: Option<u64>,
     backfill_chunk_size: Option<u64>,
+    shutdown_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -241,6 +246,8 @@ pub struct Pipeline {
     /// Upper bound on how long a partial batch waits before being written.
     pub flush_interval_ms: u64,
     pub backfill_chunk_size: u64,
+    /// How long graceful shutdown waits before the process aborts.
+    pub shutdown_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +407,10 @@ impl Config {
         let flush_interval_ms = raw.pipeline.flush_interval_ms.unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
         bound("pipeline.flush_interval_ms", flush_interval_ms, 50, 60_000)?;
 
+        let shutdown_timeout_ms =
+            raw.pipeline.shutdown_timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
+        bound("pipeline.shutdown_timeout_ms", shutdown_timeout_ms, 100, 120_000)?;
+
         let backfill_chunk_size = raw.pipeline.backfill_chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK);
         bound("pipeline.backfill_chunk_size", backfill_chunk_size, 1, 100_000)?;
 
@@ -423,6 +434,7 @@ impl Config {
                 batch_size,
                 flush_interval_ms,
                 backfill_chunk_size,
+                shutdown_timeout_ms,
             },
             log: Log { filter },
         })

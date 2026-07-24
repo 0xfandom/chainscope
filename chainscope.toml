@@ -57,6 +57,11 @@ batch_size = 500
 # batch_size, so a quiet chain does not hold the last few blocks unwritten.
 flush_interval_ms = 2000
 
+# How long graceful shutdown waits for the stages to wind down before the
+# process aborts. Generous, because the writer may be mid-commit when the
+# signal lands, and a killed commit simply replays on the next start.
+shutdown_timeout_ms = 10000
+
 # Blocks per historical backfill work unit. Shrinks automatically when a
 # provider rejects the range as too wide.
 backfill_chunk_size = 2000
