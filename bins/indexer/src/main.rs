@@ -4,16 +4,18 @@ mod config;
 mod consumer;
 mod db;
 mod producer;
+mod supervisor;
 
-use std::{sync::Arc, time::Duration};
+use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
 use chainscope_eth_source::EthSource;
 use config::Config;
+use supervisor::{Shutdown, Supervisor};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> anyhow::Result<ExitCode> {
     // A missing .env is not an error — the environment may already carry the
     // variables, which is how it works in Docker.
     let _ = dotenvy::dotenv();
@@ -86,8 +88,6 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(cfg.chain.poll_interval_ms),
         cancel.clone(),
     );
-    let producer_task = tokio::spawn(producer.run());
-
     // The writer drains blocks and commits them with the cursor, one
     // transaction per batch. In M1 it consumes BlockUnit directly and writes the
     // blocks table; M2 inserts a transformer ahead of it and the writer moves to
@@ -98,23 +98,43 @@ async fn main() -> anyhow::Result<()> {
         cfg.pipeline.batch_size,
         Duration::from_millis(cfg.pipeline.flush_interval_ms),
     );
-    let writer_task = tokio::spawn(writer.run());
 
-    // Proper supervision — join set, shutdown ordering, failure propagation —
-    // is #8. This is the minimum that makes Ctrl-C behave: signal cancellation,
-    // let the producer stop and close the seam, let the writer flush its last
-    // batch (cursor included) and exit.
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => tracing::info!("interrupt received, shutting down"),
-        r = producer_task => { r??; tracing::info!("producer finished"); }
-    }
-    cancel.cancel();
-    if let Err(e) = writer_task.await? {
-        tracing::error!(error = %e, "writer failed");
-        return Err(e);
-    }
+    // Every stage runs under one supervisor sharing one cancellation token.
+    // Shutdown order is not scripted here: tripping the token makes the producer
+    // stop and drop its sink, that closure closes the stream, and the writer
+    // drains and commits its final batch before returning. The signal handler is
+    // just another supervised task that trips the token.
+    let mut sup = Supervisor::new(
+        cancel.clone(),
+        Duration::from_millis(cfg.pipeline.shutdown_timeout_ms),
+    );
+    sup.spawn("producer", producer.run());
+    sup.spawn("writer", writer.run());
+    sup.spawn("signals", {
+        let cancel = cancel.clone();
+        async move {
+            supervisor::wait_for_shutdown_signal(cancel).await;
+            Ok(())
+        }
+    });
 
-    Ok(())
+    match sup.supervise().await {
+        Shutdown::Clean => {
+            tracing::info!("shutdown complete");
+            Ok(ExitCode::SUCCESS)
+        }
+        Shutdown::Failed => {
+            tracing::error!("a stage died; exiting non-zero");
+            Ok(ExitCode::FAILURE)
+        }
+        Shutdown::TimedOut => {
+            // A stage would not wind down in time. Abort hard rather than hang —
+            // a killed process is safe here, since the writer's transaction
+            // means an interrupted commit simply replays on the next start.
+            tracing::error!("shutdown timed out; aborting");
+            std::process::abort();
+        }
+    }
 }
 
 /// RUST_LOG wins over the config file, so a running process can be made verbose

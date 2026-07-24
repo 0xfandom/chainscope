@@ -66,6 +66,26 @@ Error: database.url is not set. Set DATABASE_URL in .env, or database.url in cha
 Startup logs a summary of the configuration it ended up with, passwords and API
 keys redacted.
 
+## Supervision and shutdown
+
+Every stage — producer, writer, signal handler — runs as a task in one
+`JoinSet` under a shared cancellation token. The supervisor enforces two things.
+
+**Shutdown is a planned crash.** Because a real crash is already safe (the
+writer's transaction guarantees exactly-once), a clean stop needs no separate
+save path. SIGINT or SIGTERM trips the token; the producer stops and drops its
+sink; that closure closes the stream; the writer drains and commits its final
+batch, cursor included, and exits. The order is not scripted — it falls out of
+the token plus the closed stream.
+
+**Partial failure is never tolerated.** A pipeline running with one dead stage
+keeps looking healthy while silently making no progress, which is worse than
+stopping. So any task that ends unexpectedly — an error, a panic, or even a
+clean return while nobody asked to stop — cancels every other stage and brings
+the process down non-zero, with the stage named in the log. A bounded
+`shutdown_timeout_ms` backs it: a stage that will not wind down cannot hang the
+process, it aborts instead.
+
 ## The writer, and exactly-once
 
 The writer drains blocks from the seam, gathers them into batches, and commits
