@@ -29,7 +29,11 @@ use std::{
 
 use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
 use chainscope_indexer::{
-    consumer::Writer, db, producer::Producer, testkit::SyntheticChain, transformer::Transformer,
+    consumer::Writer,
+    db,
+    producer::Producer,
+    testkit::{SyntheticChain, SYNTHETIC_POOL},
+    transformer::Transformer,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -37,17 +41,27 @@ use tokio_util::sync::CancellationToken;
 
 const HEIGHT: u64 = 150;
 
-/// A `BlockUnit` as the writer now sees it: a `RowBatch` carrying only the block
-/// header, no decoded rows. The synthetic chain produces no watched logs, so
-/// this is what the transformer would emit for every block.
-fn empty_row_batch(b: &BlockUnit) -> RowBatch {
+/// The `RowBatch` the transformer would emit for a synthetic block: its header
+/// plus the one decoded swap its log carries. Built through the real `map_log`
+/// so the teeth test writes exactly what the pipeline writes — one swap per
+/// block, which is what `check_consistency` now expects.
+fn decoded_row_batch(b: &BlockUnit) -> RowBatch {
+    let mut swaps = Vec::new();
+    let mut liq_events = Vec::new();
+    for log in &b.logs {
+        match chainscope_eth_source::map_log(log) {
+            chainscope_eth_source::Mapped::Swap(s) => swaps.push(s),
+            chainscope_eth_source::Mapped::Liq(l) => liq_events.push(l),
+            _ => {}
+        }
+    }
     RowBatch {
         block_number: b.number,
         block_hash: b.hash,
         parent_hash: b.parent_hash,
         block_time: b.timestamp,
-        swaps: vec![],
-        liq_events: vec![],
+        swaps,
+        liq_events,
     }
 }
 
@@ -86,6 +100,19 @@ async fn fresh_db(admin: &PgPool) -> (PgPool, String) {
         .await
         .expect("connect to test database");
     db::migrate(&pool).await.expect("migrate test database");
+    // The synthetic chain stamps its blocks on 2026-07-24 (testkit BASE_TS).
+    // The migration only creates partitions around the real current date, so
+    // create that specific day's partitions here — otherwise a swap insert on a
+    // machine whose clock is past the migrated window would fail.
+    for parent in ["swaps", "liq_events"] {
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {parent}_20260724 PARTITION OF {parent} \
+             FOR VALUES FROM ('2026-07-24') TO ('2026-07-25')"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create synthetic-day partition");
+    }
     (pool, name)
 }
 
@@ -121,6 +148,7 @@ async fn check_consistency(pool: &PgPool) -> Result<(), String> {
             (SELECT count(*)                  FROM blocks)                    AS n,
             (SELECT COALESCE(min(number), 0)  FROM blocks)                    AS lo,
             (SELECT COALESCE(max(number), 0)  FROM blocks)                    AS hi,
+            (SELECT count(*)                  FROM swaps)                     AS swaps,
             (SELECT live_cursor               FROM chain_state WHERE id = 1)  AS cursor",
     )
     .fetch_one(pool)
@@ -129,6 +157,7 @@ async fn check_consistency(pool: &PgPool) -> Result<(), String> {
     let n: i64 = row.get("n");
     let lo: i64 = row.get("lo");
     let hi: i64 = row.get("hi");
+    let swaps: i64 = row.get("swaps");
     let cursor: Option<i64> = row.get("cursor");
 
     if n > 0 {
@@ -140,6 +169,15 @@ async fn check_consistency(pool: &PgPool) -> Result<(), String> {
         if hi - lo + 1 != n {
             return Err(format!("gap: range [{lo}..={hi}] holds only {n} rows"));
         }
+    }
+
+    // The synthetic chain emits exactly one decodable swap per block, and the
+    // swap commits in the same transaction as its block. So the swap count must
+    // equal the block count at every crash boundary: a smaller count would mean
+    // a block landed without its swap (non-atomic write), a larger one would
+    // mean a swap was double-counted on replay (broken ON CONFLICT).
+    if swaps != n {
+        return Err(format!("swap count {swaps} does not match block count {n}"));
     }
 
     if let Some(c) = cursor {
@@ -187,11 +225,11 @@ async fn run_then_kill(pool: &PgPool, kill_after: Duration) {
         Duration::from_millis(1),
         CancellationToken::new(),
     );
-    // Empty watched set: the synthetic chain's logs are not from any watched
-    // pool, so every RowBatch is empty. That is exactly what this test wants —
-    // it proves the block-level exactly-once invariant, which decoded rows ride
-    // on; the row-level no-double-count proof is in #25.
-    let transformer = Transformer::new(raw_source, row_sink, Vec::<[u8; 20]>::new());
+    // Watch the synthetic pool so each block's Swap decodes into exactly one
+    // SwapRow. That lets the invariant below check row-level exactly-once — no
+    // swap without its block, no double-counted swap on replay — not just the
+    // block-level version.
+    let transformer = Transformer::new(raw_source, row_sink, vec![SYNTHETIC_POOL]);
     // Small batches and a short flush so a randomised kill frequently lands
     // mid-batch, which is the case that matters most.
     let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(4));
@@ -218,6 +256,8 @@ async fn run_then_kill(pool: &PgPool, kill_after: Duration) {
 async fn run_trial(pool: &PgPool, seed: u64) {
     // Fresh state for this trial; the ephemeral DB is shared across the 50.
     sqlx::query("TRUNCATE blocks").execute(pool).await.unwrap();
+    sqlx::query("TRUNCATE swaps").execute(pool).await.unwrap();
+    sqlx::query("TRUNCATE liq_events").execute(pool).await.unwrap();
     sqlx::query("UPDATE chain_state SET live_cursor = NULL WHERE id = 1")
         .execute(pool)
         .await
@@ -246,15 +286,22 @@ async fn run_trial(pool: &PgPool, seed: u64) {
         );
     }
 
-    // The end state must be the whole chain, exactly once, cursor at the top.
-    let row = sqlx::query("SELECT count(*) AS n, COALESCE(max(number),0) AS hi FROM blocks")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    // The end state must be the whole chain, exactly once, cursor at the top —
+    // and one swap per block, no more, no fewer.
+    let row = sqlx::query(
+        "SELECT count(*) AS n, COALESCE(max(number),0) AS hi,
+                (SELECT count(*) FROM swaps) AS swaps
+           FROM blocks",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     let n: i64 = row.get("n");
     let hi: i64 = row.get("hi");
+    let swaps: i64 = row.get("swaps");
     assert_eq!(n as u64, HEIGHT, "seed {seed}: wrong block count (gaps or duplicates)");
     assert_eq!(hi as u64, HEIGHT, "seed {seed}: highest block is not the chain tip");
+    assert_eq!(swaps as u64, HEIGHT, "seed {seed}: wrong swap count (double-counted or lost)");
     assert_eq!(cursor(pool).await, HEIGHT, "seed {seed}: cursor is not at the tip");
 }
 
@@ -299,7 +346,7 @@ async fn a_cursor_ahead_of_the_rows_is_detected() {
 
     // Write blocks 1..=5 the correct, atomic way. The invariant holds.
     let chain = SyntheticChain::new(HEIGHT);
-    let batch: Vec<_> = (1..=5).map(|n| empty_row_batch(&chain.unit(n))).collect();
+    let batch: Vec<_> = (1..=5).map(|n| decoded_row_batch(&chain.unit(n))).collect();
     db::write_row_batches(&pool, &batch, false).await.unwrap();
     check_consistency(&pool)
         .await
