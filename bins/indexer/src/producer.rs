@@ -6,9 +6,12 @@
 //! first, and every shortcut taken here is one that a later milestone can undo
 //! without changing the shape of what crosses the seam.
 //!
-//! The parent hash is already carried in every `BlockUnit` even though nothing
-//! reads it yet. That is the point: when M4 adds reorg detection it changes the
-//! consumer, not the producer and not the message.
+//! The parent hash carried in every `BlockUnit` is what M4 reads: before a block
+//! is published, an optional [`ReorgHandler`] checks it against the chain we have
+//! recorded. On a fork the handler rewinds the database and the producer resumes
+//! from the fork point — the producer owns `next`, so it is the natural place to
+//! wind that pointer back. With no handler injected (the offline tests) the
+//! check is skipped and the producer behaves exactly as it did in M1.
 
 use std::{sync::Arc, time::Duration};
 
@@ -19,6 +22,8 @@ use chainscope_core::{
 use rand::Rng;
 use tokio_util::sync::CancellationToken;
 use tracing::{field, info_span, Instrument};
+
+use crate::reorg::{Continuity, ReorgHandler};
 
 /// How a transient failure is retried.
 ///
@@ -110,6 +115,9 @@ pub struct Producer {
     poll_interval: Duration,
     retry: RetryPolicy,
     cancel: CancellationToken,
+    /// Reorg guard, consulted before each block is published. `None` disables
+    /// the check — the shape the M1 offline tests still run in.
+    reorg: Option<Arc<dyn ReorgHandler>>,
 }
 
 impl Producer {
@@ -129,7 +137,15 @@ impl Producer {
             poll_interval,
             retry: RetryPolicy::default(),
             cancel,
+            reorg: None,
         }
+    }
+
+    /// Attach the reorg guard. Added as a builder so the existing constructor —
+    /// and every test that calls it — is untouched.
+    pub fn with_reorg_handler(mut self, handler: Arc<dyn ReorgHandler>) -> Self {
+        self.reorg = Some(handler);
+        self
     }
 
     /// Decide the first block to fetch.
@@ -191,6 +207,23 @@ impl Producer {
                 match self.fetch_and_publish(next).await? {
                     Published::Yes => next += 1,
 
+                    // A reorg was detected and the database rewound. The block we
+                    // just fetched sits above the hole, so it is not published;
+                    // instead we wind `next` back to the fork point and re-enter
+                    // the outer poll, which re-fetches the canonical branch
+                    // forward from there. Breaking rather than continuing re-polls
+                    // the tip, harmless since the tip is still at or above the
+                    // fork point.
+                    Published::Rewound { fork_point } => {
+                        tracing::warn!(
+                            from = next,
+                            fork_point,
+                            "reorg: resuming from the fork point"
+                        );
+                        next = fork_point + 1;
+                        break;
+                    }
+
                     // The node does not have a block it just told us existed.
                     // Providers behind a load balancer disagree by a block or
                     // two, so re-polling the head is the right answer and
@@ -246,6 +279,19 @@ impl Producer {
             Err(e) => return Err(e.into()),
         };
 
+        // Reorg guard (M4). Before publishing, make sure this block extends the
+        // chain we recorded. On a fork the handler has already rewound the
+        // database; we report it so the run loop resumes from the fork point
+        // rather than publishing a block whose parent no longer exists.
+        if let Some(handler) = &self.reorg {
+            match handler.on_block(&unit).await? {
+                Continuity::Extends => {}
+                Continuity::RewoundTo { fork_point } => {
+                    return Ok(Published::Rewound { fork_point })
+                }
+            }
+        }
+
         span.record("hash", hex::encode(unit.hash));
         span.record("logs", unit.logs.len());
         let _enter = span.enter();
@@ -270,6 +316,8 @@ enum Published {
     Yes,
     NotYetAvailable,
     SinkClosed,
+    /// A reorg was handled; resume from `fork_point + 1`.
+    Rewound { fork_point: u64 },
 }
 
 #[cfg(test)]

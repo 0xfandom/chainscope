@@ -6,7 +6,7 @@ use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
 use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
-    consumer, db, finality, producer,
+    consumer, db, finality, producer, reorg,
     supervisor::{self, Shutdown, Supervisor},
     transformer,
 };
@@ -79,6 +79,10 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     let cancel = CancellationToken::new();
 
+    // The reorg guard (#46): before each block is published it is checked
+    // against the chain we have recorded, and on a fork the database is rewound
+    // to the fork point so the producer re-indexes the canonical branch forward.
+    let reorg_handler = Arc::new(reorg::DbReorgHandler::new(Arc::clone(&source), pool.clone()));
     let producer = producer::Producer::new(
         Arc::clone(&source),
         raw_sink,
@@ -86,7 +90,8 @@ async fn main() -> anyhow::Result<ExitCode> {
         cfg.chain.start_block,
         Duration::from_millis(cfg.chain.poll_interval_ms),
         cancel.clone(),
-    );
+    )
+    .with_reorg_handler(reorg_handler);
     // The transformer sits between: it decodes each block's watched logs into a
     // RowBatch. It watches the same contracts the source fetches for — the pools
     // plus the factory — so a pool event decodes and a factory PoolCreated is
