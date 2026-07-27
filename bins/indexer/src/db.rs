@@ -59,6 +59,87 @@ pub async fn load_live_cursor(pool: &PgPool) -> anyhow::Result<Option<u64>> {
         .transpose()
 }
 
+/// Read the backfill's resume point — the contiguous done-prefix of history.
+///
+/// `None` means no historical range has been completed yet, so backfill starts
+/// at the configured `start_block`. Everything at or below `Some(n)` is known
+/// complete; the driver resumes at `n + 1`.
+pub async fn load_backfill_cursor(pool: &PgPool) -> anyhow::Result<Option<u64>> {
+    let cursor: Option<i64> =
+        sqlx::query_scalar("SELECT backfill_cursor FROM chain_state WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .context("could not read the backfill cursor")?;
+
+    cursor
+        .map(|c| u64::try_from(c).map_err(|_| anyhow::anyhow!("backfill_cursor is negative: {c}")))
+        .transpose()
+}
+
+/// Write a chunk's decoded blocks and advance the *backfill* cursor, atomically.
+///
+/// The historical twin of [`write_row_batches`]. It shares the same per-row
+/// inserts and the same all-or-nothing guarantee, and differs in exactly one
+/// way: it advances `backfill_cursor` — the contiguous done-prefix of history —
+/// rather than `live_cursor`.
+///
+/// The cursor is advanced to `covered_up_to`, the top of the chunk's block
+/// range, **not** the highest block that produced a row. A chunk spans many
+/// blocks and most of them are empty for the pools we watch; advancing to the
+/// range top records that those empty blocks are done too, so a restart does not
+/// re-scan them. `GREATEST` keeps it forward-only, so a replayed chunk cannot
+/// drag the done-prefix backwards.
+///
+/// Because it is a single transaction, a crash mid-chunk leaves either the whole
+/// chunk written with the cursor naming its top, or nothing — the same crash
+/// contract the live path proved in M2, now for backfill.
+///
+/// The bulk `COPY` path and the stream-then-discard window gating are #35; this
+/// keeps the per-row inserts so #34 can prove the driver's contract
+/// (exactly-once, restartable, finality-bounded) against a recent range where
+/// the day partitions already exist.
+pub async fn write_backfill_batches(
+    pool: &PgPool,
+    batches: &[RowBatch],
+    covered_up_to: u64,
+    fail_before_commit: bool,
+) -> anyhow::Result<u64> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("could not open backfill write transaction")?;
+
+    for b in batches {
+        insert_block(&mut tx, b).await?;
+        for s in &b.swaps {
+            insert_swap(&mut tx, b, s).await?;
+        }
+        for l in &b.liq_events {
+            insert_liq(&mut tx, b, l).await?;
+        }
+    }
+
+    sqlx::query(
+        "UPDATE chain_state
+            SET backfill_cursor = GREATEST(COALESCE(backfill_cursor, -1), $1),
+                updated_at       = now()
+          WHERE id = 1",
+    )
+    .bind(covered_up_to as i64)
+    .execute(&mut *tx)
+    .await
+    .context("could not advance the backfill cursor")?;
+
+    if fail_before_commit {
+        return Err(anyhow::anyhow!("injected failure before commit"));
+    }
+
+    tx.commit()
+        .await
+        .context("could not commit the backfill write transaction")?;
+    Ok(batches.len() as u64)
+}
+
 /// Write a batch of decoded blocks and advance the cursor, atomically.
 ///
 /// This is the transaction where the project's exactly-once guarantee is
