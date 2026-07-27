@@ -6,7 +6,7 @@ use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
 use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
-    consumer, db, producer,
+    consumer, db, finality, producer,
     supervisor::{self, Shutdown, Supervisor},
     transformer,
 };
@@ -103,6 +103,18 @@ async fn main() -> anyhow::Result<ExitCode> {
         Duration::from_millis(cfg.pipeline.flush_interval_ms),
     );
 
+    // The finality tracker (#44) polls the tip and its finality line on the same
+    // interval as the producer, advances `chain_state.finalized_height`
+    // monotonically, and prunes the `blocks` reorg window down to the still
+    // reorg-eligible band. It reads the head like the producer does but writes
+    // only the finality columns, so it never contends with the writer's cursor.
+    let finality = finality::FinalityTracker::new(
+        Arc::clone(&source),
+        pool.clone(),
+        Duration::from_millis(cfg.chain.poll_interval_ms),
+        cancel.clone(),
+    );
+
     // Every stage runs under one supervisor sharing one cancellation token.
     // Shutdown order is not scripted here: tripping the token makes the producer
     // stop and drop its sink; that closes the stream into the transformer, which
@@ -116,6 +128,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     sup.spawn("producer", producer.run());
     sup.spawn("transformer", transformer.run());
     sup.spawn("writer", writer.run());
+    sup.spawn("finality", finality.run());
     sup.spawn("signals", {
         let cancel = cancel.clone();
         async move {
