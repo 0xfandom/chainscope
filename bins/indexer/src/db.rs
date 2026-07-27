@@ -110,17 +110,74 @@ const STAGE_STMTS: [&str; 3] = [
 // NOTHING on the same natural keys the per-row path uses keeps a replayed chunk a
 // no-op — the dedupe COPY itself cannot express, which is why the rows are staged
 // first rather than COPYed straight in.
-const MOVE_STMTS: [&str; 3] = [
-    "INSERT INTO blocks (number, block_hash, parent_hash, block_time)
-     SELECT number, decode(block_hash,'hex'), decode(parent_hash,'hex'), to_timestamp(block_time)
-     FROM stage_blocks ON CONFLICT (number) DO NOTHING",
-    "INSERT INTO swaps (block_time, tx_hash, log_index, block_number, pool, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick)
-     SELECT to_timestamp(block_time), decode(tx_hash,'hex'), log_index, block_number, decode(pool,'hex'), decode(sender,'hex'), decode(recipient,'hex'), amount0::numeric, amount1::numeric, sqrt_price_x96::numeric, liquidity::numeric, tick
-     FROM stage_swaps ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
-    "INSERT INTO liq_events (block_time, tx_hash, log_index, block_number, pool, kind, owner, tick_lower, tick_upper, amount, amount0, amount1)
-     SELECT to_timestamp(block_time), decode(tx_hash,'hex'), log_index, block_number, decode(pool,'hex'), kind, decode(owner,'hex'), tick_lower, tick_upper, amount::numeric, amount0::numeric, amount1::numeric
-     FROM stage_liq ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
-];
+const BLOCKS_MOVE: &str = "
+INSERT INTO blocks (number, block_hash, parent_hash, block_time)
+SELECT number, decode(block_hash,'hex'), decode(parent_hash,'hex'), to_timestamp(block_time)
+FROM stage_blocks ON CONFLICT (number) DO NOTHING";
+
+const LIQ_MOVE: &str = "
+INSERT INTO liq_events (block_time, tx_hash, log_index, block_number, pool, kind, owner, tick_lower, tick_upper, amount, amount0, amount1)
+SELECT to_timestamp(block_time), decode(tx_hash,'hex'), log_index, block_number, decode(pool,'hex'), kind, decode(owner,'hex'), tick_lower, tick_upper, amount::numeric, amount0::numeric, amount1::numeric
+FROM stage_liq ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING";
+
+// Move in-window swaps into the partitions and fold every new swap into the 1m
+// candles (#36), in one statement so the two can never disagree.
+//
+// The candle set is `moved` — the swaps just inserted, taken from `RETURNING`
+// so a replayed chunk (which inserts nothing) contributes nothing and volume is
+// never double-counted — UNION the below-window staged swaps, which are folded
+// into aggregates but not stored raw. Price is derived from sqrtPriceX96 the
+// Uniswap V3 way: (sqrt/2^96)^2 = sqrt^2 / 2^192, a token1/token0 ratio.
+//
+// On conflict `open` is left untouched: because history is written in block
+// order, the earliest swap of a bucket is always seen first, so the stored open
+// is already the true open. `close` becomes the latest write's close, high/low
+// widen, and volume and trade_count accumulate.
+//
+// `$1` is the window floor (unix seconds); `i64::MIN` disables it.
+const CANDLE_MOVE: &str = "
+WITH moved AS (
+    INSERT INTO swaps (block_time, tx_hash, log_index, block_number, pool, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick)
+    SELECT to_timestamp(block_time), decode(tx_hash,'hex'), log_index, block_number, decode(pool,'hex'), decode(sender,'hex'), decode(recipient,'hex'), amount0::numeric, amount1::numeric, sqrt_price_x96::numeric, liquidity::numeric, tick
+    FROM stage_swaps WHERE block_time >= $1
+    ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING
+    RETURNING pool, block_time, block_number, log_index, sqrt_price_x96, amount0, amount1
+),
+new_swaps AS (
+    SELECT pool, block_time, block_number, log_index, sqrt_price_x96, amount0, amount1 FROM moved
+    UNION ALL
+    SELECT decode(pool,'hex'), to_timestamp(block_time), block_number, log_index, sqrt_price_x96::numeric, amount0::numeric, amount1::numeric
+    FROM stage_swaps WHERE block_time < $1
+),
+priced AS (
+    SELECT pool,
+           date_trunc('minute', block_time) AS bucket,
+           block_number, log_index,
+           (sqrt_price_x96 * sqrt_price_x96) / power(2::numeric, 192) AS price,
+           abs(amount0) AS v0,
+           abs(amount1) AS v1
+    FROM new_swaps
+),
+agg AS (
+    SELECT pool, bucket,
+           (array_agg(price ORDER BY block_number, log_index))[1]           AS open,
+           (array_agg(price ORDER BY block_number DESC, log_index DESC))[1] AS close,
+           max(price) AS high,
+           min(price) AS low,
+           sum(v0)    AS volume0,
+           sum(v1)    AS volume1,
+           count(*)   AS trade_count
+    FROM priced GROUP BY pool, bucket
+)
+INSERT INTO ohlcv_1m (pool, bucket, open, high, low, close, volume0, volume1, trade_count)
+SELECT pool, bucket, open, high, low, close, volume0, volume1, trade_count FROM agg
+ON CONFLICT (pool, bucket) DO UPDATE SET
+    high        = GREATEST(ohlcv_1m.high, EXCLUDED.high),
+    low         = LEAST(ohlcv_1m.low, EXCLUDED.low),
+    close       = EXCLUDED.close,
+    volume0     = ohlcv_1m.volume0 + EXCLUDED.volume0,
+    volume1     = ohlcv_1m.volume1 + EXCLUDED.volume1,
+    trade_count = ohlcv_1m.trade_count + EXCLUDED.trade_count";
 
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -187,12 +244,26 @@ pub async fn bulk_write_backfill(
     stats.persisted = sp + lp;
     stats.discarded = sd + ld;
 
-    for stmt in MOVE_STMTS {
+    // Move block headers and liquidity events into the partitions (idempotent).
+    for stmt in [BLOCKS_MOVE, LIQ_MOVE] {
         sqlx::query(stmt)
             .execute(&mut *tx)
             .await
             .context("could not move staged rows into the raw tables")?;
     }
+
+    // Move in-window swaps into the partitions AND fold every new swap into the 1m
+    // candles, in one statement (#36). The candle set is the swaps just inserted
+    // (via RETURNING, so a replay contributes nothing) plus the below-window swaps
+    // we deliberately do not store raw — so aggregates cover all history while raw
+    // disk stays bounded to the window. `$1` is the window floor; `i64::MIN` means
+    // no floor, so everything is in-window and nothing is below it.
+    let floor = window_floor.unwrap_or(i64::MIN);
+    sqlx::query(CANDLE_MOVE)
+        .bind(floor)
+        .execute(&mut *tx)
+        .await
+        .context("could not move swaps and fold candles")?;
 
     sqlx::query(
         "UPDATE chain_state
@@ -249,7 +320,12 @@ async fn copy_blocks(
     Ok(())
 }
 
-/// COPY the in-window swaps into `stage_swaps`, returning (persisted, discarded).
+/// COPY *all* swaps into `stage_swaps`, returning (persisted, discarded).
+///
+/// Every swap is staged — in-window and below-window alike — because the candle
+/// fold aggregates both. Which become raw rows is decided by the move
+/// (`block_time >= floor`), not here. `persisted` counts the in-window swaps that
+/// will be stored, `discarded` the below-window ones that feed aggregates only.
 async fn copy_swaps(
     conn: &mut sqlx::postgres::PgConnection,
     batches: &[RowBatch],
@@ -266,10 +342,6 @@ async fn copy_swaps(
     for b in batches {
         let keep = within_window(window_floor, b.block_time);
         for s in &b.swaps {
-            if !keep {
-                discarded += 1;
-                continue;
-            }
             line.clear();
             let _ = writeln!(
                 line,
@@ -288,7 +360,11 @@ async fn copy_swaps(
                 s.tick
             );
             copy.send(line.as_bytes()).await?;
-            persisted += 1;
+            if keep {
+                persisted += 1;
+            } else {
+                discarded += 1;
+            }
         }
     }
     copy.finish().await.context("COPY into stage_swaps failed")?;
