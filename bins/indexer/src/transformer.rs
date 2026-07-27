@@ -84,49 +84,68 @@ impl Transformer {
         }
     }
 
-    /// Decode one block's watched logs into a `RowBatch`.
+    /// Decode one block's watched logs into a `RowBatch`, folding any
+    /// unknown-event count into this stage's running health signal.
     ///
     /// Always returns a batch, even when the block produced no rows. An empty
     /// batch still carries the block's identity forward so the writer advances
     /// the cursor and does not re-scan the block on the next run.
     fn transform(&mut self, block: &BlockUnit) -> RowBatch {
-        let mut swaps = Vec::new();
-        let mut liq_events = Vec::new();
+        let (batch, unknown) = decode_block(block, &self.watched);
+        self.unknown_total += unknown;
+        batch
+    }
+}
 
-        for log in &block.logs {
-            // Not one of our contracts — the RPC filter should have excluded it
-            // already, but a synthetic source or a widened filter might not, and
-            // decoding a stranger's log would only invent unknown-event noise.
-            if !self.watched.contains(&log.address) {
-                continue;
-            }
+/// Decode one block's watched logs into a `RowBatch`, plus a count of logs from
+/// a watched contract whose signature is not one we index.
+///
+/// Free-standing because two callers need exactly this — the transformer stage
+/// on the live path, and the backfill driver (#34) on the historical path.
+/// Keeping the "filter to watched, then `map_log`" rule in one place means the
+/// two paths cannot drift into decoding the same block differently.
+///
+/// The returned batch always carries the block's identity, even with no rows,
+/// so a caller can advance its cursor past a block that produced nothing.
+pub fn decode_block(block: &BlockUnit, watched: &HashSet<Address20>) -> (RowBatch, u64) {
+    let mut swaps = Vec::new();
+    let mut liq_events = Vec::new();
+    let mut unknown = 0u64;
 
-            match map_log(log) {
-                Mapped::Swap(s) => swaps.push(s),
-                Mapped::Liq(l) => liq_events.push(l),
-                // Understood, deliberately not stored in M2 (factory PoolCreated).
-                Mapped::Ignored(_) => {}
-                Mapped::Unknown => {
-                    self.unknown_total += 1;
-                    tracing::warn!(
-                        pool = %hex::encode(log.address),
-                        tx = %hex::encode(log.tx_hash),
-                        log_index = log.log_index,
-                        "unknown event from a watched contract; not decoded"
-                    );
-                }
-            }
+    for log in &block.logs {
+        // Not one of our contracts — the RPC filter should have excluded it
+        // already, but a synthetic source or a widened filter might not, and
+        // decoding a stranger's log would only invent unknown-event noise.
+        if !watched.contains(&log.address) {
+            continue;
         }
 
-        RowBatch {
-            block_number: block.number,
-            block_hash: block.hash,
-            parent_hash: block.parent_hash,
-            block_time: block.timestamp,
-            swaps,
-            liq_events,
+        match map_log(log) {
+            Mapped::Swap(s) => swaps.push(s),
+            Mapped::Liq(l) => liq_events.push(l),
+            // Understood, deliberately not stored in M2 (factory PoolCreated).
+            Mapped::Ignored(_) => {}
+            Mapped::Unknown => {
+                unknown += 1;
+                tracing::warn!(
+                    pool = %hex::encode(log.address),
+                    tx = %hex::encode(log.tx_hash),
+                    log_index = log.log_index,
+                    "unknown event from a watched contract; not decoded"
+                );
+            }
         }
     }
+
+    let batch = RowBatch {
+        block_number: block.number,
+        block_hash: block.hash,
+        parent_hash: block.parent_hash,
+        block_time: block.timestamp,
+        swaps,
+        liq_events,
+    };
+    (batch, unknown)
 }
 
 #[cfg(test)]
@@ -166,6 +185,7 @@ mod tests {
                  000000000000000000000000000000000000000000000000167c18e4d07ef6ef\
                  000000000000000000000000000000000000000000000000000000000003109a",
             ),
+            block_number: 25_601_357,
             tx_hash: h("e18a03325588278d1d9605c762339598b31f34a5f8b2fd62a7ff0bfed60eb5dc"),
             log_index: 39,
         }
