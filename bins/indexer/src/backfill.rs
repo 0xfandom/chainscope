@@ -44,6 +44,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use chainscope_core::{source::ChainSource, types::Address20};
@@ -74,6 +75,10 @@ pub struct BackfillDriver {
     watched: HashSet<Address20>,
     start_block: u64,
     chunk_size: u64,
+    /// Raw retention floor in unix seconds (#35): a block older than this has its
+    /// rows folded into the aggregates but not stored raw. `None` keeps every
+    /// raw row — the default until the candle aggregator makes discarding safe.
+    window_floor: Option<i64>,
     cancel: CancellationToken,
 }
 
@@ -92,8 +97,16 @@ impl BackfillDriver {
             watched: watched.into_iter().collect(),
             start_block,
             chunk_size,
+            window_floor: None,
             cancel,
         }
+    }
+
+    /// Set the raw-retention floor (unix seconds): blocks older than this keep no
+    /// raw rows, only aggregates. Defaults to no floor (keep everything).
+    pub fn with_window_floor(mut self, floor: Option<i64>) -> Self {
+        self.window_floor = floor;
+        self
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -115,18 +128,29 @@ impl BackfillDriver {
 
         let mut chunker = LogChunker::new(Arc::clone(&self.source), start, floor, self.chunk_size);
         let mut committed_blocks: u64 = 0;
-        let mut committed_rows: u64 = 0;
+        let mut persisted_rows: u64 = 0;
+        let mut discarded_rows: u64 = 0;
 
         loop {
             if self.cancel.is_cancelled() {
-                tracing::info!(committed_blocks, committed_rows, "backfill stopped (cancelled)");
+                tracing::info!(
+                    committed_blocks,
+                    persisted_rows,
+                    discarded_rows,
+                    "backfill stopped (cancelled)"
+                );
                 return Ok(());
             }
 
             let chunk = match chunker.next_chunk().await {
                 Ok(Some(c)) => c,
                 Ok(None) => {
-                    tracing::info!(committed_blocks, committed_rows, "backfill complete");
+                    tracing::info!(
+                        committed_blocks,
+                        persisted_rows,
+                        discarded_rows,
+                        "backfill complete"
+                    );
                     return Ok(());
                 }
                 // Transient has already been through the failover pool; Fatal is a
@@ -140,7 +164,6 @@ impl BackfillDriver {
             let active: BTreeSet<u64> = chunk.logs.iter().map(|l| l.block_number).collect();
 
             let mut batches = Vec::with_capacity(active.len());
-            let mut chunk_rows: u64 = 0;
             for number in &active {
                 if self.cancel.is_cancelled() {
                     // Abandon the chunk unwritten. The cursor is untouched, so the
@@ -151,24 +174,33 @@ impl BackfillDriver {
                 }
                 let unit = self.source.fetch_block(*number).await?;
                 let (batch, _unknown) = decode_block(&unit, &self.watched);
-                chunk_rows += (batch.swaps.len() + batch.liq_events.len()) as u64;
                 batches.push(batch);
             }
 
             // One transaction: the chunk's rows and the cursor advance to the
-            // chunk's top move together. The cursor goes to `chunk.to`, not the
-            // last active block, so the empty blocks in the chunk are recorded as
-            // done and are not re-scanned.
-            db::write_backfill_batches(&self.pool, &batches, chunk.to, false).await?;
+            // chunk's top move together via bulk COPY. The cursor goes to
+            // `chunk.to`, not the last active block, so the empty blocks in the
+            // chunk are recorded as done and are not re-scanned. Rows older than
+            // the retention window are folded into aggregates (#36) but not stored
+            // raw.
+            let started = Instant::now();
+            let stats =
+                db::bulk_write_backfill(&self.pool, &batches, chunk.to, self.window_floor, false)
+                    .await?;
+            let elapsed = started.elapsed();
+
             committed_blocks += active.len() as u64;
-            committed_rows += chunk_rows;
+            persisted_rows += stats.persisted;
+            discarded_rows += stats.discarded;
             tracing::info!(
                 from = chunk.from,
                 to = chunk.to,
                 active = active.len(),
-                rows = chunk_rows,
+                persisted = stats.persisted,
+                discarded = stats.discarded,
                 width = chunk.width(),
-                "backfill chunk committed"
+                duration_ms = elapsed.as_millis() as u64,
+                "backfill chunk committed (bulk COPY)"
             );
         }
     }

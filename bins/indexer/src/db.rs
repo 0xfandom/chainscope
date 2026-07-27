@@ -6,6 +6,8 @@
 //! `_sqlx_migrations` table and applies only what is missing — running twice
 //! against the same database is a no-op.
 
+use std::fmt::Write as _;
+
 use anyhow::Context;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Postgres;
@@ -76,47 +78,120 @@ pub async fn load_backfill_cursor(pool: &PgPool) -> anyhow::Result<Option<u64>> 
         .transpose()
 }
 
-/// Write a chunk's decoded blocks and advance the *backfill* cursor, atomically.
+/// How a bulk backfill write split between kept and discarded raw rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkStats {
+    /// Raw event rows COPYed into the partitions — those within the window.
+    pub persisted: u64,
+    /// Raw event rows dropped because their block is older than the window floor.
+    /// They still feed the aggregator (#36); only the raw row is not stored.
+    pub discarded: u64,
+}
+
+// Staging tables, dropped at commit. Deliberately plain column types — epoch
+// seconds, hex strings, decimal strings — so the COPY payload is all digits,
+// hex and decimals with no tabs, newlines or backslashes and therefore needs no
+// escaping. The exact casts (`to_timestamp`, `decode(_, 'hex')`, `::numeric`)
+// happen in the move below, where a bad value would fail loudly rather than
+// corrupt silently.
+//
+// Run one statement per query rather than a single multi-statement `raw_sql`:
+// `raw_sql().execute()` imposes a higher-ranked `Executor` bound that makes the
+// spawned driver future fail the "Send is not general enough" check, whereas the
+// plain `query().execute(&mut *tx)` path is the one the per-row writer already
+// proved Send-safe.
+const STAGE_STMTS: [&str; 3] = [
+    "CREATE TEMP TABLE stage_blocks (number BIGINT, block_hash TEXT, parent_hash TEXT, block_time BIGINT) ON COMMIT DROP",
+    "CREATE TEMP TABLE stage_swaps (block_time BIGINT, tx_hash TEXT, log_index INT, block_number BIGINT, pool TEXT, sender TEXT, recipient TEXT, amount0 TEXT, amount1 TEXT, sqrt_price_x96 TEXT, liquidity TEXT, tick INT) ON COMMIT DROP",
+    "CREATE TEMP TABLE stage_liq (block_time BIGINT, tx_hash TEXT, log_index INT, block_number BIGINT, pool TEXT, kind TEXT, owner TEXT, tick_lower INT, tick_upper INT, amount TEXT, amount0 TEXT, amount1 TEXT) ON COMMIT DROP",
+];
+
+// Move staged rows into the partitioned raw tables, idempotently. ON CONFLICT DO
+// NOTHING on the same natural keys the per-row path uses keeps a replayed chunk a
+// no-op — the dedupe COPY itself cannot express, which is why the rows are staged
+// first rather than COPYed straight in.
+const MOVE_STMTS: [&str; 3] = [
+    "INSERT INTO blocks (number, block_hash, parent_hash, block_time)
+     SELECT number, decode(block_hash,'hex'), decode(parent_hash,'hex'), to_timestamp(block_time)
+     FROM stage_blocks ON CONFLICT (number) DO NOTHING",
+    "INSERT INTO swaps (block_time, tx_hash, log_index, block_number, pool, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick)
+     SELECT to_timestamp(block_time), decode(tx_hash,'hex'), log_index, block_number, decode(pool,'hex'), decode(sender,'hex'), decode(recipient,'hex'), amount0::numeric, amount1::numeric, sqrt_price_x96::numeric, liquidity::numeric, tick
+     FROM stage_swaps ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
+    "INSERT INTO liq_events (block_time, tx_hash, log_index, block_number, pool, kind, owner, tick_lower, tick_upper, amount, amount0, amount1)
+     SELECT to_timestamp(block_time), decode(tx_hash,'hex'), log_index, block_number, decode(pool,'hex'), kind, decode(owner,'hex'), tick_lower, tick_upper, amount::numeric, amount0::numeric, amount1::numeric
+     FROM stage_liq ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
+];
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Bulk-write a chunk's decoded rows via `COPY`, gated by the retention window,
+/// advancing the *backfill* cursor in the same transaction.
 ///
-/// The historical twin of [`write_row_batches`]. It shares the same per-row
-/// inserts and the same all-or-nothing guarantee, and differs in exactly one
-/// way: it advances `backfill_cursor` — the contiguous done-prefix of history —
-/// rather than `live_cursor`.
+/// The fast, disk-aware historical write path (#35). It does three things at
+/// once:
 ///
-/// The cursor is advanced to `covered_up_to`, the top of the chunk's block
-/// range, **not** the highest block that produced a row. A chunk spans many
-/// blocks and most of them are empty for the pools we watch; advancing to the
-/// range top records that those empty blocks are done too, so a restart does not
-/// re-scan them. `GREATEST` keeps it forward-only, so a replayed chunk cannot
-/// drag the done-prefix backwards.
+///  * **Bulk speed.** Rows are streamed with Postgres `COPY` into per-chunk
+///    staging tables, then moved into the partitioned raw tables with a single
+///    `INSERT ... SELECT ... ON CONFLICT DO NOTHING`. `COPY` is several times
+///    faster than a round trip per row, and staging is what keeps the move
+///    idempotent — `COPY` cannot express `ON CONFLICT`, and dropping the
+///    natural-key dedupe is not a trade this project makes.
 ///
-/// Because it is a single transaction, a crash mid-chunk leaves either the whole
-/// chunk written with the cursor naming its top, or nothing — the same crash
-/// contract the live path proved in M2, now for backfill.
+///  * **Exactness.** Amounts travel as their decimal string and are cast
+///    `::numeric` on the way in — the same decimal round trip the per-row writer
+///    uses, so nothing is rounded (see [`write_row_batches`]).
 ///
-/// The bulk `COPY` path and the stream-then-discard window gating are #35; this
-/// keeps the per-row inserts so #34 can prove the driver's contract
-/// (exactly-once, restartable, finality-bounded) against a recent range where
-/// the day partitions already exist.
-pub async fn write_backfill_batches(
+///  * **Stream-then-discard.** A block older than `window_floor` (unix seconds)
+///    has its raw rows counted but *not* stored — to be folded into the
+///    aggregates by #36 — so raw disk stays bounded to the window while the
+///    aggregates cover all history. `None` keeps everything, the default until
+///    the candle aggregator lands and a finite window becomes safe.
+///
+/// One transaction: a crash mid-`COPY` rolls the rows and the cursor back
+/// together. The cursor advances to `covered_up_to` — the chunk's range top —
+/// regardless of how many rows were kept, so empty and below-window blocks are
+/// still recorded as done and never re-scanned.
+pub async fn bulk_write_backfill(
     pool: &PgPool,
     batches: &[RowBatch],
     covered_up_to: u64,
+    window_floor: Option<i64>,
     fail_before_commit: bool,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<BulkStats> {
     let mut tx = pool
         .begin()
         .await
-        .context("could not open backfill write transaction")?;
+        .context("could not open bulk backfill transaction")?;
 
-    for b in batches {
-        insert_block(&mut tx, b).await?;
-        for s in &b.swaps {
-            insert_swap(&mut tx, b, s).await?;
-        }
-        for l in &b.liq_events {
-            insert_liq(&mut tx, b, l).await?;
-        }
+    for stmt in STAGE_STMTS {
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .context("could not create staging tables")?;
+    }
+
+    // Each COPY runs in its own helper so the `PgCopyIn` borrow of the connection
+    // lives within a single concrete lifetime. Held inline across the send loop
+    // instead, it trips the compiler's "Send is not general enough" limitation
+    // once the driver future is spawned (which the supervisor does).
+    let mut stats = BulkStats::default();
+    copy_blocks(&mut tx, batches, window_floor).await?;
+    let (sp, sd) = copy_swaps(&mut tx, batches, window_floor).await?;
+    let (lp, ld) = copy_liq(&mut tx, batches, window_floor).await?;
+    stats.persisted = sp + lp;
+    stats.discarded = sd + ld;
+
+    for stmt in MOVE_STMTS {
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .context("could not move staged rows into the raw tables")?;
     }
 
     sqlx::query(
@@ -136,8 +211,135 @@ pub async fn write_backfill_batches(
 
     tx.commit()
         .await
-        .context("could not commit the backfill write transaction")?;
-    Ok(batches.len() as u64)
+        .context("could not commit the bulk backfill transaction")?;
+    Ok(stats)
+}
+
+/// True when a block at `t` (unix seconds) is inside the retention window.
+fn within_window(window_floor: Option<i64>, t: i64) -> bool {
+    window_floor.is_none_or(|floor| t >= floor)
+}
+
+/// COPY the block headers within the window into `stage_blocks`.
+async fn copy_blocks(
+    conn: &mut sqlx::postgres::PgConnection,
+    batches: &[RowBatch],
+    window_floor: Option<i64>,
+) -> anyhow::Result<()> {
+    let mut copy = conn
+        .copy_in_raw("COPY stage_blocks (number, block_hash, parent_hash, block_time) FROM STDIN")
+        .await?;
+    let mut line = String::new();
+    for b in batches
+        .iter()
+        .filter(|b| within_window(window_floor, b.block_time))
+    {
+        line.clear();
+        let _ = writeln!(
+            line,
+            "{}\t{}\t{}\t{}",
+            b.block_number,
+            hex(&b.block_hash),
+            hex(&b.parent_hash),
+            b.block_time
+        );
+        copy.send(line.as_bytes()).await?;
+    }
+    copy.finish().await.context("COPY into stage_blocks failed")?;
+    Ok(())
+}
+
+/// COPY the in-window swaps into `stage_swaps`, returning (persisted, discarded).
+async fn copy_swaps(
+    conn: &mut sqlx::postgres::PgConnection,
+    batches: &[RowBatch],
+    window_floor: Option<i64>,
+) -> anyhow::Result<(u64, u64)> {
+    let (mut persisted, mut discarded) = (0u64, 0u64);
+    let mut copy = conn
+        .copy_in_raw(
+            "COPY stage_swaps (block_time, tx_hash, log_index, block_number, pool, sender, \
+             recipient, amount0, amount1, sqrt_price_x96, liquidity, tick) FROM STDIN",
+        )
+        .await?;
+    let mut line = String::new();
+    for b in batches {
+        let keep = within_window(window_floor, b.block_time);
+        for s in &b.swaps {
+            if !keep {
+                discarded += 1;
+                continue;
+            }
+            line.clear();
+            let _ = writeln!(
+                line,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                b.block_time,
+                hex(&s.tx_hash),
+                s.log_index,
+                b.block_number,
+                hex(&s.pool),
+                hex(&s.sender),
+                hex(&s.recipient),
+                s.amount0,
+                s.amount1,
+                s.sqrt_price_x96,
+                s.liquidity,
+                s.tick
+            );
+            copy.send(line.as_bytes()).await?;
+            persisted += 1;
+        }
+    }
+    copy.finish().await.context("COPY into stage_swaps failed")?;
+    Ok((persisted, discarded))
+}
+
+/// COPY the in-window liquidity events into `stage_liq`, returning
+/// (persisted, discarded).
+async fn copy_liq(
+    conn: &mut sqlx::postgres::PgConnection,
+    batches: &[RowBatch],
+    window_floor: Option<i64>,
+) -> anyhow::Result<(u64, u64)> {
+    let (mut persisted, mut discarded) = (0u64, 0u64);
+    let mut copy = conn
+        .copy_in_raw(
+            "COPY stage_liq (block_time, tx_hash, log_index, block_number, pool, kind, owner, \
+             tick_lower, tick_upper, amount, amount0, amount1) FROM STDIN",
+        )
+        .await?;
+    let mut line = String::new();
+    for b in batches {
+        let keep = within_window(window_floor, b.block_time);
+        for l in &b.liq_events {
+            if !keep {
+                discarded += 1;
+                continue;
+            }
+            line.clear();
+            let _ = writeln!(
+                line,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                b.block_time,
+                hex(&l.tx_hash),
+                l.log_index,
+                b.block_number,
+                hex(&l.pool),
+                l.kind.as_str(),
+                hex(&l.owner),
+                l.tick_lower,
+                l.tick_upper,
+                l.amount,
+                l.amount0,
+                l.amount1
+            );
+            copy.send(line.as_bytes()).await?;
+            persisted += 1;
+        }
+    }
+    copy.finish().await.context("COPY into stage_liq failed")?;
+    Ok((persisted, discarded))
 }
 
 /// Write a batch of decoded blocks and advance the cursor, atomically.
