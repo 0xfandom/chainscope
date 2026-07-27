@@ -175,8 +175,10 @@ mod tests {
             address: [0u8; 20],
             topics: vec![],
             data: vec![],
+            block_number: block,
             tx_hash: [0u8; 32],
-            // block number encoded here so the coverage test can read it back.
+            // block number encoded here too so the coverage test can read it back
+            // without depending on the fields under test.
             log_index: block as u32,
         }
     }

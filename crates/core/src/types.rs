@@ -28,6 +28,12 @@ pub struct RawLog {
     /// `topics[0]` is the event signature; the rest are indexed parameters.
     pub topics: Vec<Hash32>,
     pub data: Vec<u8>,
+    /// Block that produced this log. On the live path every log in a
+    /// `BlockUnit` shares the block's number; it is carried per-log because the
+    /// backfill path fetches logs across a *range* with one `eth_getLogs` call
+    /// and needs to know which block each log belongs to — that is how the
+    /// backfill driver discovers which blocks in a chunk are active.
+    pub block_number: u64,
     pub tx_hash: Hash32,
     /// Position within the block. Block-unique, which is what makes
     /// `(tx_hash, log_index)` a valid natural key.

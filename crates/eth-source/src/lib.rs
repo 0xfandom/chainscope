@@ -159,6 +159,10 @@ fn convert_log(log: Log) -> Result<RawLog, SourceError> {
         address: log.address().into(),
         topics: log.topics().iter().map(|t| (*t).into()).collect(),
         data: log.data().data.to_vec(),
+        // Present on every mined log from both eth_getLogs and eth_getBlockByNumber;
+        // absent only for pending logs, which we never request. Missing it would
+        // leave the backfill driver unable to tell which block a log came from.
+        block_number: log.block_number.ok_or_else(|| missing("block number"))?,
         tx_hash: log
             .transaction_hash
             .ok_or_else(|| missing("transaction hash"))?

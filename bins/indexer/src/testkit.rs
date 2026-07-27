@@ -116,6 +116,7 @@ impl SyntheticChain {
                 word_addr(SYNTHETIC_RECIPIENT),
             ],
             data,
+            block_number: n,
             tx_hash: self.hash_at(n),
             log_index: 0,
         }]
