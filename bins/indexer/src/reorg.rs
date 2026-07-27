@@ -21,6 +21,9 @@
 //! cheapest question the chain can be asked, and paying for a full block to
 //! answer it would make reorg checks cost more than ingestion.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chainscope_core::{source::ChainSource, BlockUnit};
 use sqlx::postgres::PgPool;
 
@@ -99,5 +102,63 @@ pub async fn check_continuity(
             return Ok(ChainCheck::Forked { fork_point: height });
         }
         height -= 1;
+    }
+}
+
+/// What the producer should do with an incoming block, after any reorg it
+/// triggered has already been handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Continuity {
+    /// The block extends the recorded chain. Publish it.
+    Extends,
+    /// A reorg was found and the database was rewound to `fork_point`. The block
+    /// just fetched must not be published — it sits above a hole now — so the
+    /// producer resumes fetching from `fork_point + 1` and re-indexes the
+    /// canonical branch forward.
+    RewoundTo { fork_point: u64 },
+}
+
+/// The reorg concern, as the producer sees it: hand it each freshly-fetched
+/// block and it either waves the block through or rewinds the database and tells
+/// the producer where to resume.
+///
+/// A trait so the producer stays offline-testable — the existing producer tests
+/// construct it with no handler at all, and this is injected only in the wired
+/// binary.
+#[async_trait]
+pub trait ReorgHandler: Send + Sync {
+    async fn on_block(&self, incoming: &BlockUnit) -> anyhow::Result<Continuity>;
+}
+
+/// The production handler: detect against the recorded chain, and on a fork
+/// rewind the database before telling the producer to resume from the fork
+/// point.
+pub struct DbReorgHandler {
+    source: Arc<dyn ChainSource>,
+    pool: PgPool,
+}
+
+impl DbReorgHandler {
+    pub fn new(source: Arc<dyn ChainSource>, pool: PgPool) -> Self {
+        Self { source, pool }
+    }
+}
+
+#[async_trait]
+impl ReorgHandler for DbReorgHandler {
+    async fn on_block(&self, incoming: &BlockUnit) -> anyhow::Result<Continuity> {
+        match check_continuity(&*self.source, &self.pool, incoming).await? {
+            ChainCheck::Extends => Ok(Continuity::Extends),
+            ChainCheck::Forked { fork_point } => {
+                let removed = db::rewind_to(&self.pool, fork_point, false).await?;
+                tracing::warn!(
+                    fork_point,
+                    orphaned_blocks = removed,
+                    incoming = incoming.number,
+                    "reorg detected; rewound to the fork point"
+                );
+                Ok(Continuity::RewoundTo { fork_point })
+            }
+        }
     }
 }
