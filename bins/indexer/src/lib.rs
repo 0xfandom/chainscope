@@ -6,6 +6,7 @@
 //! them. A behavioural claim tested against a copy of the code proves nothing
 //! about the code that ships. The binary is a thin `main` over these modules.
 
+pub mod backfill;
 pub mod chunker;
 pub mod config;
 pub mod consumer;
