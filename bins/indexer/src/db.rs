@@ -184,6 +184,73 @@ pub async fn advance_finality(
     })
 }
 
+/// Unwind every row above `fork_point` and reset the live cursor to it,
+/// atomically.
+///
+/// A reorg replaced the blocks above `fork_point`. This deletes the orphaned
+/// headers, swaps and liquidity events, and moves `live_cursor` back to
+/// `fork_point` so the producer re-indexes the canonical branch forward through
+/// the ordinary write path. The delete and the cursor reset are one
+/// transaction: a crash can leave only the pre-rewind state or the fully-rewound
+/// state, never a hole the cursor does not record.
+///
+/// Re-indexing is deliberately *not* held inside this transaction. Fetching
+/// canonical blocks is network round trips, and pinning a Postgres transaction
+/// open across them would hold locks for the length of an RPC storm. Because the
+/// cursor is reset atomically with the delete, the forward re-index is an
+/// ordinary resumable write — each canonical block commits with its own
+/// exactly-once guarantee.
+///
+/// The cursor is *set*, not `GREATEST`-ed: a rewind must move it back.
+///
+/// Returns the number of block headers removed. `fail_before_commit` exists only
+/// for tests, to assert the delete and the reset roll back together.
+pub async fn rewind_to(
+    pool: &PgPool,
+    fork_point: u64,
+    fail_before_commit: bool,
+) -> anyhow::Result<u64> {
+    let f = fork_point as i64;
+    let mut tx = pool.begin().await.context("could not open the rewind transaction")?;
+
+    // swaps and liq_events are partitioned on block_time but carry block_number,
+    // so a reorg — which is expressed in block numbers, not times — deletes by
+    // block_number across whatever partitions the orphaned blocks fell in.
+    let removed = sqlx::query("DELETE FROM blocks WHERE number > $1")
+        .bind(f)
+        .execute(&mut *tx)
+        .await
+        .context("could not delete orphaned block headers")?
+        .rows_affected();
+
+    sqlx::query("DELETE FROM swaps WHERE block_number > $1")
+        .bind(f)
+        .execute(&mut *tx)
+        .await
+        .context("could not delete orphaned swaps")?;
+
+    sqlx::query("DELETE FROM liq_events WHERE block_number > $1")
+        .bind(f)
+        .execute(&mut *tx)
+        .await
+        .context("could not delete orphaned liquidity events")?;
+
+    sqlx::query(
+        "UPDATE chain_state SET live_cursor = $1, updated_at = now() WHERE id = 1",
+    )
+    .bind(f)
+    .execute(&mut *tx)
+    .await
+    .context("could not roll the live cursor back to the fork point")?;
+
+    if fail_before_commit {
+        return Err(anyhow::anyhow!("injected failure before commit"));
+    }
+
+    tx.commit().await.context("could not commit the rewind")?;
+    Ok(removed)
+}
+
 /// How a bulk backfill write split between kept and discarded raw rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BulkStats {
