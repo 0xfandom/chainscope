@@ -13,6 +13,7 @@ pub mod consumer;
 pub mod db;
 pub mod finality;
 pub mod producer;
+pub mod reorg;
 pub mod supervisor;
 pub mod testkit;
 pub mod transformer;
