@@ -184,27 +184,78 @@ pub async fn advance_finality(
     })
 }
 
-/// Unwind every row above `fork_point` and reset the live cursor to it,
-/// atomically.
+// Candle compensation for a reorg (#47), all inside the rewind transaction.
+//
+// Deleting orphaned swaps is only half the correction: the candles those swaps
+// fed still carry their volume — and, worse, a high or low that the deleted
+// trade set. Volume and count could be subtracted, but open/high/low/close
+// cannot: removing the trade that *was* the high means the new high can only be
+// found from what remains. So every affected bucket is recomputed from the
+// swaps that survive, not patched.
+//
+// `reorg_buckets` captures the affected `(pool, minute)` buckets *before* the
+// swaps are deleted; the recompute reads them back and rebuilds each candle
+// from the surviving raw rows. A reorg only ever touches pending (recent)
+// blocks, which sit inside the raw retention window, so every surviving
+// swap of an affected bucket is still on disk — a recent bucket cannot also
+// hold an old, below-window swap that was folded then discarded, because those
+// swaps are not in the same minute. So the surviving raw rows are the whole
+// truth for the bucket, and a full recompute is exact.
+const REORG_CAPTURE_BUCKETS: &str = "
+CREATE TEMP TABLE reorg_buckets ON COMMIT DROP AS
+SELECT DISTINCT pool, date_trunc('minute', block_time) AS bucket
+FROM swaps WHERE block_number > $1";
+
+// Drop every affected bucket's candle, then reinsert only those that still have
+// surviving swaps. A bucket left with no survivors produces no group row, so it
+// stays deleted — the minute becomes a true gap again.
+const REORG_DROP_AFFECTED_CANDLES: &str = "
+DELETE FROM ohlcv_1m o USING reorg_buckets b
+WHERE o.pool = b.pool AND o.bucket = b.bucket";
+
+const REORG_RECOMPUTE_CANDLES: &str = "
+INSERT INTO ohlcv_1m (pool, bucket, open, high, low, close, volume0, volume1, trade_count)
+SELECT pool, bucket,
+       (array_agg(price ORDER BY block_number, log_index))[1]           AS open,
+       max(price) AS high,
+       min(price) AS low,
+       (array_agg(price ORDER BY block_number DESC, log_index DESC))[1] AS close,
+       sum(v0) AS volume0, sum(v1) AS volume1, count(*) AS trade_count
+FROM (
+    SELECT s.pool,
+           date_trunc('minute', s.block_time) AS bucket,
+           s.block_number, s.log_index,
+           (s.sqrt_price_x96 * s.sqrt_price_x96) / power(2::numeric, 192) AS price,
+           abs(s.amount0) AS v0,
+           abs(s.amount1) AS v1
+    FROM swaps s
+    JOIN reorg_buckets b
+      ON s.pool = b.pool AND date_trunc('minute', s.block_time) = b.bucket
+) priced
+GROUP BY pool, bucket";
+
+/// Unwind every row above `fork_point`, compensate the candles it fed, and reset
+/// the live cursor to it, atomically.
 ///
 /// A reorg replaced the blocks above `fork_point`. This deletes the orphaned
-/// headers, swaps and liquidity events, and moves `live_cursor` back to
+/// headers, swaps and liquidity events, recomputes every candle those swaps
+/// touched from the swaps that survive (#47), and moves `live_cursor` back to
 /// `fork_point` so the producer re-indexes the canonical branch forward through
-/// the ordinary write path. The delete and the cursor reset are one
-/// transaction: a crash can leave only the pre-rewind state or the fully-rewound
-/// state, never a hole the cursor does not record.
+/// the ordinary write path. All of it is one transaction: a crash can leave only
+/// the pre-rewind state or the fully-rewound state, and a reader never sees
+/// candles that disagree with the raw rows beneath them.
 ///
-/// Re-indexing is deliberately *not* held inside this transaction. Fetching
-/// canonical blocks is network round trips, and pinning a Postgres transaction
-/// open across them would hold locks for the length of an RPC storm. Because the
-/// cursor is reset atomically with the delete, the forward re-index is an
-/// ordinary resumable write — each canonical block commits with its own
-/// exactly-once guarantee.
+/// Re-indexing the canonical branch is deliberately *not* held inside this
+/// transaction. Fetching canonical blocks is network round trips, and pinning a
+/// Postgres transaction open across them would hold locks for the length of an
+/// RPC storm. Because the cursor is reset atomically with the delete, the
+/// forward re-index is an ordinary resumable write — each canonical block
+/// commits with its own exactly-once guarantee.
 ///
 /// The cursor is *set*, not `GREATEST`-ed: a rewind must move it back.
 ///
 /// Returns the number of block headers removed. `fail_before_commit` exists only
-/// for tests, to assert the delete and the reset roll back together.
+/// for tests, to assert the whole rewind rolls back together.
 pub async fn rewind_to(
     pool: &PgPool,
     fork_point: u64,
@@ -212,6 +263,13 @@ pub async fn rewind_to(
 ) -> anyhow::Result<u64> {
     let f = fork_point as i64;
     let mut tx = pool.begin().await.context("could not open the rewind transaction")?;
+
+    // Capture the candle buckets the orphaned swaps fed, before the swaps go.
+    sqlx::query(REORG_CAPTURE_BUCKETS)
+        .bind(f)
+        .execute(&mut *tx)
+        .await
+        .context("could not capture the affected candle buckets")?;
 
     // swaps and liq_events are partitioned on block_time but carry block_number,
     // so a reorg — which is expressed in block numbers, not times — deletes by
@@ -234,6 +292,15 @@ pub async fn rewind_to(
         .execute(&mut *tx)
         .await
         .context("could not delete orphaned liquidity events")?;
+
+    // Recompute the affected candles from the survivors: drop them all, then
+    // reinsert the buckets that still have swaps.
+    for stmt in [REORG_DROP_AFFECTED_CANDLES, REORG_RECOMPUTE_CANDLES] {
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .context("could not recompute the affected candles")?;
+    }
 
     sqlx::query(
         "UPDATE chain_state SET live_cursor = $1, updated_at = now() WHERE id = 1",
