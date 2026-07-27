@@ -3,7 +3,7 @@
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
 use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
-use chainscope_eth_source::EthSource;
+use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
     consumer, db, producer,
@@ -47,8 +47,10 @@ async fn main() -> anyhow::Result<ExitCode> {
         cfg.pipeline.channel_capacity,
     );
 
-    // Only the first endpoint is used. The failover pool across all configured
-    // endpoints is M3; the trait it hides behind already exists.
+    // Every configured endpoint goes into one failover pool (#32). A call that
+    // hits a transiently-unwell endpoint rotates to the next healthy one; the
+    // producer above it never learns there is more than one. A single-endpoint
+    // config is just a pool of one — same code path, no special case.
     let watched: Vec<_> = cfg
         .chain
         .pools
@@ -57,7 +59,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         .chain(std::iter::once(cfg.chain.factory.0))
         .collect();
     let source: Arc<dyn ChainSource> =
-        Arc::new(EthSource::new(&cfg.chain.rpc_endpoints[0], &watched));
+        Arc::new(PooledSource::from_endpoints(&cfg.chain.rpc_endpoints, &watched));
 
     // Reach the chain once before claiming to be ready. An indexer that cannot
     // read the chain has nothing to do, so finding out now — with a clear
