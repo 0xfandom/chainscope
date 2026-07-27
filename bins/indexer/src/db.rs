@@ -95,6 +95,29 @@ pub async fn load_finalized_height(pool: &PgPool) -> anyhow::Result<Option<u64>>
         .transpose()
 }
 
+/// Read a recorded block hash from the reorg window.
+///
+/// `None` means we hold no header at that height — either it was never written
+/// (a fresh window) or it has been pruned as finalised. The reorg walk (#45)
+/// uses this to compare our recorded chain against the node's.
+pub async fn stored_block_hash(
+    pool: &PgPool,
+    number: u64,
+) -> anyhow::Result<Option<chainscope_core::types::Hash32>> {
+    let raw: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT block_hash FROM blocks WHERE number = $1")
+            .bind(number as i64)
+            .fetch_optional(pool)
+            .await
+            .with_context(|| format!("could not read the stored hash for block {number}"))?;
+
+    raw.map(|bytes| {
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("block {number} has a {}-byte hash, not 32", bytes.len()))
+    })
+    .transpose()
+}
+
 /// The outcome of advancing the finality tier.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FinalityUpdate {
