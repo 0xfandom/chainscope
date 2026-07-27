@@ -78,6 +78,89 @@ pub async fn load_backfill_cursor(pool: &PgPool) -> anyhow::Result<Option<u64>> 
         .transpose()
 }
 
+/// Read the finality line — the highest block treated as irreversible.
+///
+/// `None` means finality has not been established yet: a fresh database, before
+/// the finality tracker's first successful poll. Everything at or below
+/// `Some(n)` is frozen — reorg detection (#39) never walks past it, and the
+/// `blocks` header window holds nothing at or below it.
+pub async fn load_finalized_height(pool: &PgPool) -> anyhow::Result<Option<u64>> {
+    let h: Option<i64> =
+        sqlx::query_scalar("SELECT finalized_height FROM chain_state WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .context("could not read the finalized height")?;
+
+    h.map(|v| u64::try_from(v).map_err(|_| anyhow::anyhow!("finalized_height is negative: {v}")))
+        .transpose()
+}
+
+/// The outcome of advancing the finality tier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FinalityUpdate {
+    /// The stored finalised height after the update (after the monotonic max).
+    pub finalized_height: u64,
+    /// How many now-finalised headers were pruned from the reorg window.
+    pub headers_pruned: u64,
+}
+
+/// Advance the finality tier and prune the reorg window, in one transaction.
+///
+/// `head` and `finalized` are the chain tip and its finality line as just
+/// observed. Both fold in with `GREATEST`, so finality is strictly monotonic: a
+/// provider that momentarily reports a lower head or an earlier finalised block
+/// can neither un-finalise a frozen block nor drag `head_height` backwards.
+///
+/// After the update, every `blocks` header at or below the *stored* finalised
+/// height is deleted. A finalised block is irreversible, so its header can never
+/// be the answer to "does the chain I recorded still match the node's?" —
+/// keeping it would grow the window without it ever being read again. The prune
+/// reads the post-`GREATEST` height back through `RETURNING`, so a stale, lower
+/// `finalized` argument prunes nothing rather than the wrong set.
+pub async fn advance_finality(
+    pool: &PgPool,
+    head: u64,
+    finalized: u64,
+) -> anyhow::Result<FinalityUpdate> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("could not open the finality transaction")?;
+
+    let stored: i64 = sqlx::query_scalar(
+        "UPDATE chain_state
+            SET head_height      = GREATEST(COALESCE(head_height, -1), $1),
+                finalized_height = GREATEST(COALESCE(finalized_height, -1), $2),
+                updated_at       = now()
+          WHERE id = 1
+        RETURNING finalized_height",
+    )
+    .bind(head as i64)
+    .bind(finalized as i64)
+    .fetch_one(&mut *tx)
+    .await
+    .context("could not advance the finality tier")?;
+
+    // Prune against the stored height, not the argument, so monotonicity governs
+    // the prune as well: a regressive call leaves both the line and the window
+    // untouched.
+    let headers_pruned = sqlx::query("DELETE FROM blocks WHERE number <= $1")
+        .bind(stored)
+        .execute(&mut *tx)
+        .await
+        .context("could not prune finalized headers")?
+        .rows_affected();
+
+    tx.commit()
+        .await
+        .context("could not commit the finality update")?;
+
+    Ok(FinalityUpdate {
+        finalized_height: u64::try_from(stored).unwrap_or(0),
+        headers_pruned,
+    })
+}
+
 /// How a bulk backfill write split between kept and discarded raw rows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BulkStats {
