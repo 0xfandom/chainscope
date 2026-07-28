@@ -17,6 +17,39 @@ services:
       timeout: 5s
       retries: 10
 
+  # Redpanda: the phase-2 log transport (M5). A Kafka-API-compatible broker in a
+  # single native binary — no JVM, no ZooKeeper — so it is one more service here,
+  # not a cluster to run. The pipeline stages publish to and consume from topics
+  # on it instead of the in-process channel, which is what lets them become
+  # separate processes and lets several consumers read the same event stream.
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: chainscope-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      # dev-container: a relaxed single-node profile for a laptop, not production.
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+      # One listener on 9092, advertised as localhost so a client on the host
+      # (the indexer and the tests, for now) connects to localhost:9092.
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+    ports:
+      - "${REDPANDA_KAFKA_PORT:-9092}:9092"
+      - "9644:9644" # admin API, used by the healthcheck
+    volumes:
+      - chainscope-redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -qE 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
 volumes:
   chainscope-pgdata:
     name: chainscope-pgdata
+  chainscope-redpanda:
+    name: chainscope-redpanda
