@@ -36,6 +36,18 @@ const DEFAULT_BATCH_SIZE: usize = 500;
 // last few blocks unwritten indefinitely.
 const DEFAULT_FLUSH_INTERVAL_MS: u64 = 2_000;
 const DEFAULT_BACKFILL_CHUNK: u64 = 2_000;
+// Kafka/Redpanda transport (M5). These only take effect when
+// pipeline.transport = "kafka"; they are validated regardless so a
+// misconfiguration surfaces at startup, not on the first publish.
+const DEFAULT_KAFKA_BROKER: &str = "localhost:9092";
+const DEFAULT_KAFKA_BLOCKS_TOPIC: &str = "chainscope.blocks";
+const DEFAULT_KAFKA_ROWS_TOPIC: &str = "chainscope.decoded-rows";
+// Partitioned by pool address for per-pool ordering (see M5 #61). Six is a
+// sane laptop default; production would size it to the pool count.
+const DEFAULT_KAFKA_PARTITIONS: i32 = 6;
+// 48h. The log only needs to outlive the reorg window plus consumer lag, and
+// disk is a hard constraint, so retention is deliberately short.
+const DEFAULT_KAFKA_RETENTION_MS: i64 = 172_800_000;
 // Ethereum produces a block every ~12s. Polling faster costs quota for nothing;
 // polling slower adds latency the whole pipeline inherits.
 const DEFAULT_POLL_INTERVAL_MS: u64 = 4_000;
@@ -167,6 +179,8 @@ struct RawConfig {
     #[serde(default)]
     pipeline: RawPipeline,
     #[serde(default)]
+    kafka: RawKafka,
+    #[serde(default)]
     log: RawLog,
 }
 
@@ -202,6 +216,16 @@ struct RawPipeline {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawKafka {
+    brokers: Option<StringList>,
+    blocks_topic: Option<String>,
+    rows_topic: Option<String>,
+    partitions: Option<i32>,
+    retention_ms: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLog {
     filter: Option<String>,
 }
@@ -215,6 +239,7 @@ pub struct Config {
     pub database: Database,
     pub chain: Chain,
     pub pipeline: Pipeline,
+    pub kafka: Kafka,
     pub log: Log,
 }
 
@@ -248,6 +273,25 @@ pub struct Pipeline {
     pub backfill_chunk_size: u64,
     /// How long graceful shutdown waits before the process aborts.
     pub shutdown_timeout_ms: u64,
+}
+
+/// Kafka/Redpanda transport settings (M5). Only consulted when
+/// `pipeline.transport = "kafka"`, but always validated so a bad value fails at
+/// startup rather than on the first publish.
+#[derive(Debug, Clone)]
+pub struct Kafka {
+    /// Broker `host:port` list. Redpanda advertises `localhost:9092` by default.
+    pub brokers: Vec<String>,
+    /// The producer → transformer topic (`BlockUnit`s).
+    pub blocks_topic: String,
+    /// The transformer → writer topic (`RowBatch`es).
+    pub rows_topic: String,
+    /// Partitions per topic. Events are keyed by pool address, so this bounds
+    /// per-pool ordering groups and cross-pool parallelism.
+    pub partitions: i32,
+    /// Log retention in milliseconds — long enough to cover the reorg window
+    /// plus consumer lag, short enough to bound disk.
+    pub retention_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -414,6 +458,54 @@ impl Config {
         let backfill_chunk_size = raw.pipeline.backfill_chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK);
         bound("pipeline.backfill_chunk_size", backfill_chunk_size, 1, 100_000)?;
 
+        // --- kafka (M5 transport) ---
+        let raw_brokers = raw.kafka.brokers.map(|l| l.0).unwrap_or_default();
+        let brokers = if raw_brokers.is_empty() {
+            vec![DEFAULT_KAFKA_BROKER.to_owned()]
+        } else {
+            for (i, b) in raw_brokers.iter().enumerate() {
+                // A broker is host:port. A light shape check catches the common
+                // "forgot the port" mistake without pretending to resolve DNS.
+                let (host, port) = b.rsplit_once(':').ok_or_else(|| {
+                    ConfigError::invalid(&format!("kafka.brokers[{i}]"), b, "must be host:port")
+                })?;
+                if host.is_empty() || port.parse::<u16>().is_err() {
+                    return Err(ConfigError::invalid(
+                        &format!("kafka.brokers[{i}]"),
+                        b,
+                        "must be host:port with a numeric port",
+                    ));
+                }
+            }
+            raw_brokers
+        };
+
+        let blocks_topic = raw
+            .kafka
+            .blocks_topic
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_KAFKA_BLOCKS_TOPIC.to_owned());
+        let rows_topic = raw
+            .kafka
+            .rows_topic
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_KAFKA_ROWS_TOPIC.to_owned());
+        if blocks_topic == rows_topic {
+            return Err(ConfigError::invalid(
+                "kafka.rows_topic",
+                &rows_topic,
+                "must differ from kafka.blocks_topic",
+            ));
+        }
+
+        let partitions = raw.kafka.partitions.unwrap_or(DEFAULT_KAFKA_PARTITIONS);
+        bound("kafka.partitions", partitions.max(0) as u64, 1, 10_000)?;
+
+        let retention_ms = raw.kafka.retention_ms.unwrap_or(DEFAULT_KAFKA_RETENTION_MS);
+        // At least a minute (below that the log cannot cover any real reorg
+        // window); at most ~30 days (beyond that it stops being "short").
+        bound("kafka.retention_ms", retention_ms.max(0) as u64, 60_000, 2_592_000_000)?;
+
         // --- log ---
         let filter = raw.log.filter.unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
 
@@ -436,6 +528,13 @@ impl Config {
                 backfill_chunk_size,
                 shutdown_timeout_ms,
             },
+            kafka: Kafka {
+                brokers,
+                blocks_topic,
+                rows_topic,
+                partitions,
+                retention_ms,
+            },
             log: Log { filter },
         })
     }
@@ -454,7 +553,8 @@ impl Config {
 
         format!(
             "database.url={} max_connections={} | chain_id={} rpc_endpoints=[{}] factory={} pools={} \
-             start_block={} finality_depth={} poll_interval_ms={} | transport={} channel_capacity={} batch_size={} flush_interval_ms={} backfill_chunk_size={} | log={}",
+             start_block={} finality_depth={} poll_interval_ms={} | transport={} channel_capacity={} batch_size={} flush_interval_ms={} backfill_chunk_size={} \
+             | kafka.brokers=[{}] blocks_topic={} rows_topic={} partitions={} retention_ms={} | log={}",
             redact_url(&self.database.url),
             self.database.max_connections,
             self.chain.chain_id,
@@ -469,6 +569,11 @@ impl Config {
             self.pipeline.batch_size,
             self.pipeline.flush_interval_ms,
             self.pipeline.backfill_chunk_size,
+            self.kafka.brokers.join(", "),
+            self.kafka.blocks_topic,
+            self.kafka.rows_topic,
+            self.kafka.partitions,
+            self.kafka.retention_ms,
             self.log.filter,
         )
     }
@@ -630,6 +735,52 @@ mod tests {
     fn transport_defaults_to_channel() {
         let c = toml_config(&valid_toml()).unwrap();
         assert_eq!(c.pipeline.transport, TransportKind::Channel);
+    }
+
+    #[test]
+    fn kafka_section_fills_in_defaults() {
+        let c = toml_config(&valid_toml()).expect("should load without a [kafka] section");
+        assert_eq!(c.kafka.brokers, vec!["localhost:9092"]);
+        assert_eq!(c.kafka.blocks_topic, "chainscope.blocks");
+        assert_eq!(c.kafka.rows_topic, "chainscope.decoded-rows");
+        assert_eq!(c.kafka.partitions, DEFAULT_KAFKA_PARTITIONS);
+        assert_eq!(c.kafka.retention_ms, DEFAULT_KAFKA_RETENTION_MS);
+    }
+
+    #[test]
+    fn kafka_brokers_accepts_a_comma_separated_list() {
+        let body = format!(
+            "{}\n[kafka]\nbrokers = \"a:9092, b:9092\"\n",
+            valid_toml()
+        );
+        let c = toml_config(&body).expect("csv brokers should parse");
+        assert_eq!(c.kafka.brokers, vec!["a:9092", "b:9092"]);
+    }
+
+    #[test]
+    fn a_broker_without_a_port_is_rejected() {
+        let body = format!("{}\n[kafka]\nbrokers = [\"localhost\"]\n", valid_toml());
+        let err = toml_config(&body).unwrap_err().to_string();
+        assert!(err.contains("kafka.brokers[0]"), "{err}");
+        assert!(err.contains("host:port"), "{err}");
+    }
+
+    #[test]
+    fn identical_topics_are_rejected() {
+        let body = format!(
+            "{}\n[kafka]\nblocks_topic = \"same\"\nrows_topic = \"same\"\n",
+            valid_toml()
+        );
+        let err = toml_config(&body).unwrap_err().to_string();
+        assert!(err.contains("kafka.rows_topic"), "{err}");
+        assert!(err.contains("differ"), "{err}");
+    }
+
+    #[test]
+    fn an_absurd_retention_is_rejected() {
+        let body = format!("{}\n[kafka]\nretention_ms = 1000\n", valid_toml());
+        let err = toml_config(&body).unwrap_err().to_string();
+        assert!(err.contains("kafka.retention_ms"), "{err}");
     }
 
     #[test]
