@@ -282,6 +282,10 @@ pub struct Pipeline {
 pub struct Kafka {
     /// Broker `host:port` list. Redpanda advertises `localhost:9092` by default.
     pub brokers: Vec<String>,
+    /// The same brokers comma-joined — the exact form `rdkafka`'s
+    /// `bootstrap.servers` wants. Precomputed so the transport factory can borrow
+    /// it rather than allocating a join at the call site.
+    pub brokers_csv: String,
     /// The producer → transformer topic (`BlockUnit`s).
     pub blocks_topic: String,
     /// The transformer → writer topic (`RowBatch`es).
@@ -529,6 +533,7 @@ impl Config {
                 shutdown_timeout_ms,
             },
             kafka: Kafka {
+                brokers_csv: brokers.join(","),
                 brokers,
                 blocks_topic,
                 rows_topic,
@@ -784,11 +789,13 @@ mod tests {
     }
 
     #[test]
-    fn asking_for_kafka_early_says_when_it_arrives() {
+    fn kafka_transport_is_accepted() {
         let body = format!("{}\n[pipeline]\ntransport = \"kafka\"\n", valid_toml());
-        let err = toml_config(&body).unwrap_err().to_string();
-        assert!(err.contains("pipeline.transport"), "{err}");
-        assert!(err.contains("M5"), "should say when it lands: {err}");
+        let c = toml_config(&body).expect("kafka is a valid transport as of M5");
+        assert_eq!(c.pipeline.transport, TransportKind::Kafka);
+        // The [kafka] section defaults are enough to run against the local
+        // Redpanda, so selecting the transport alone is a complete config.
+        assert_eq!(c.kafka.brokers, vec!["localhost:9092".to_string()]);
     }
 
     #[test]

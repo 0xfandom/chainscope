@@ -34,18 +34,24 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     // The two seams the pipeline runs on. Built here, from configuration, and
     // nowhere else — a stage receives boxed traits and never learns which
-    // transport it is on. In M5 this same call returns Redpanda-backed
-    // implementations and nothing below it changes.
+    // transport it is on. Selecting `transport = "kafka"` returns the
+    // Redpanda-backed implementations and nothing below this line changes.
     //
     //   producer --[BlockUnit]--> transformer --[RowBatch]--> writer
-    let (raw_sink, raw_source) = chainscope_core::build_transport::<BlockUnit>(
-        cfg.pipeline.transport,
-        cfg.pipeline.channel_capacity,
-    );
-    let (row_sink, row_source) = chainscope_core::build_transport::<RowBatch>(
-        cfg.pipeline.transport,
-        cfg.pipeline.channel_capacity,
-    );
+    //
+    // Each seam is its own topic with its own consumer group, so the transformer
+    // and the writer commit offsets independently — a distinct `group.id` per
+    // seam, stable across restarts so a restart resumes rather than replays.
+    let (raw_sink, raw_source) = chainscope_core::build_transport::<BlockUnit>(transport_spec(
+        &cfg,
+        &cfg.kafka.blocks_topic,
+        "chainscope-transformer",
+    ))?;
+    let (row_sink, row_source) = chainscope_core::build_transport::<RowBatch>(transport_spec(
+        &cfg,
+        &cfg.kafka.rows_topic,
+        "chainscope-writer",
+    ))?;
 
     // Every configured endpoint goes into one failover pool (#32). A call that
     // hits a transiently-unwell endpoint rotates to the next healthy one; the
@@ -158,6 +164,26 @@ async fn main() -> anyhow::Result<ExitCode> {
             tracing::error!("shutdown timed out; aborting");
             std::process::abort();
         }
+    }
+}
+
+/// Translate the validated config into the factory's construction spec for one
+/// seam. `Channel` needs only a capacity; `Kafka` needs the brokers, this seam's
+/// topic, and the consumer group to read it under.
+fn transport_spec<'a>(
+    cfg: &'a Config,
+    topic: &'a str,
+    group_id: &'a str,
+) -> chainscope_core::TransportSpec<'a> {
+    match cfg.pipeline.transport {
+        chainscope_core::TransportKind::Channel => chainscope_core::TransportSpec::Channel {
+            capacity: cfg.pipeline.channel_capacity,
+        },
+        chainscope_core::TransportKind::Kafka => chainscope_core::TransportSpec::Kafka {
+            brokers: &cfg.kafka.brokers_csv,
+            topic,
+            group_id,
+        },
     }
 }
 

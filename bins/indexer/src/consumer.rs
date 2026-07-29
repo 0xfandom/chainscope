@@ -175,8 +175,10 @@ mod tests {
     /// A writer whose `collect` we drive without a database. The pool is created
     /// lazily and never connected, because `collect` never touches it.
     fn collector(max_batch: usize, flush: Duration) -> (Box<dyn EventSink<RowBatch>>, Writer) {
-        let (sink, source) =
-            chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 256);
+        let (sink, source) = chainscope_core::build_transport::<RowBatch>(
+            chainscope_core::TransportSpec::Channel { capacity: 256 },
+        )
+        .unwrap();
         let pool = PgPool::connect_lazy("postgres://unused").unwrap();
         (sink, Writer::new(pool, source, max_batch, flush))
     }

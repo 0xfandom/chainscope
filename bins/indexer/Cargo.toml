@@ -13,7 +13,9 @@ name = "chainscope-indexer"
 path = "src/main.rs"
 
 [dependencies]
-chainscope-core = { path = "../../crates/core" }
+# `kafka` on: the indexer is the process that actually runs the log transport,
+# so it compiles the librdkafka client. No other crate turns this on.
+chainscope-core = { path = "../../crates/core", features = ["kafka"] }
 chainscope-eth-source = { path = "../../crates/eth-source" }
 tokio.workspace = true
 anyhow.workspace = true

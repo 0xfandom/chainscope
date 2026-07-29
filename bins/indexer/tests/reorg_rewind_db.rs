@@ -247,10 +247,7 @@ async fn the_producer_recovers_the_canonical_branch_after_a_reorg() {
     let handler: Arc<dyn ReorgHandler> =
         Arc::new(DbReorgHandler::new(Arc::clone(&source), pool.clone()));
 
-    let (sink, mut rx) = chainscope_core::build_transport::<BlockUnit>(
-        chainscope_core::TransportKind::Channel,
-        64,
-    );
+    let (sink, mut rx) = chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
     let cancel = CancellationToken::new();
     let producer = Producer::new(
         Arc::clone(&source),

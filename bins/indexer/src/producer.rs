@@ -427,9 +427,9 @@ mod tests {
         cancel: CancellationToken,
     ) -> (Producer, Box<dyn EventSource<BlockUnit>>) {
         let (sink, src) = chainscope_core::build_transport::<BlockUnit>(
-            chainscope_core::TransportKind::Channel,
-            64,
-        );
+            chainscope_core::TransportSpec::Channel { capacity: 64 },
+        )
+        .unwrap();
         let mut p = Producer::new(
             source,
             sink,
@@ -536,9 +536,9 @@ mod tests {
         }
 
         let (sink, _rx) = chainscope_core::build_transport::<BlockUnit>(
-            chainscope_core::TransportKind::Channel,
-            8,
-        );
+            chainscope_core::TransportSpec::Channel { capacity: 8 },
+        )
+        .unwrap();
         let p = Producer::new(
             Arc::new(AlwaysFatal),
             sink,

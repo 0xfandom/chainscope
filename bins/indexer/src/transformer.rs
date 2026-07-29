@@ -212,10 +212,14 @@ mod tests {
         Transformer,
         Box<dyn EventSource<RowBatch>>,
     ) {
-        let (in_sink, in_source) =
-            chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportKind::Channel, 64);
-        let (out_sink, out_source) =
-            chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 64);
+        let (in_sink, in_source) = chainscope_core::build_transport::<BlockUnit>(
+            chainscope_core::TransportSpec::Channel { capacity: 64 },
+        )
+        .unwrap();
+        let (out_sink, out_source) = chainscope_core::build_transport::<RowBatch>(
+            chainscope_core::TransportSpec::Channel { capacity: 64 },
+        )
+        .unwrap();
         (in_sink, Transformer::new(in_source, out_sink, watched), out_source)
     }
 

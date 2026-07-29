@@ -212,9 +212,9 @@ async fn run_then_kill(pool: &PgPool, kill_after: Duration) {
     // The full three-stage pipeline, as it runs in production:
     //   producer --BlockUnit--> transformer --RowBatch--> writer
     let (raw_sink, raw_source) =
-        chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportKind::Channel, 32);
+        chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportSpec::Channel { capacity: 32 }).unwrap();
     let (row_sink, row_source) =
-        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 32);
+        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportSpec::Channel { capacity: 32 }).unwrap();
 
     let chain: Arc<dyn ChainSource> = Arc::new(SyntheticChain::new(HEIGHT));
     let producer = Producer::new(

@@ -7,11 +7,28 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 async-trait.workspace = true
+# `serde` for the wire format the log transport serialises payloads into. The
+# `NUMERIC` amounts survive the round-trip via a decimal-string shim (see
+# `types::bigdecimal_str`), not bigdecimal's own serde impl — which reads through
+# `deserialize_any` and so cannot decode from a non-self-describing format.
 bigdecimal.workspace = true
+serde.workspace = true
+# The transport wire format. Binary, compact, and defined in exactly one place
+# (the `Wire` impls), so the on-the-log bytes are stable across the stages.
+bincode = { version = "2", features = ["serde"] }
 # Only `sync`. This crate needs channels, not a runtime — pulling all of tokio
 # here would drag an executor into a library that should not have an opinion
 # about one.
 tokio = { version = "1", features = ["sync"] }
+# The Kafka/Redpanda transport (M5). Optional and feature-gated: it drags in the
+# librdkafka C client, which the read API and the chain source have no use for.
+# Only `bins/indexer` turns it on. PLAINTEXT only, so no SSL/SASL and no OpenSSL.
+rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "tokio"], optional = true }
+
+[features]
+# The log-based transport. Off by default so a crate that only needs the domain
+# types and the channel transport does not compile a C library it never calls.
+kafka = ["dep:rdkafka"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
