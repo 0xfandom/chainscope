@@ -11,7 +11,7 @@ pub mod types;
 
 pub use source::{ChainSource, SourceError};
 pub use transport::{
-    build as build_transport, channel, ChannelSink, ChannelSource, Delivery, EventSink,
-    EventSource, Receipt, TransportError, TransportKind,
+    build_transport, channel, ChannelSink, ChannelSource, Delivery, EventSink, EventSource,
+    Receipt, TransportError, TransportKind, TransportPair, TransportSpec, Wire,
 };
 pub use types::{Address20, BlockUnit, Hash32, LiqKind, LiqRow, RawLog, RowBatch, SwapRow};

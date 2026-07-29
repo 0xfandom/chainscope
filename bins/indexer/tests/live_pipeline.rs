@@ -176,9 +176,9 @@ async fn run_until_caught_up(
     target: u64,
 ) -> u64 {
     let (raw_sink, raw_source) =
-        chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportKind::Channel, 64);
+        chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
     let (row_sink, row_source) =
-        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 64);
+        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
 
     let cancel = CancellationToken::new();
     let producer = Producer::new(

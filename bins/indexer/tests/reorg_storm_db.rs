@@ -149,9 +149,9 @@ struct Pipeline {
 
 fn spawn_pipeline(pool: &PgPool, source: Arc<dyn ChainSource>, resume: Option<u64>) -> Pipeline {
     let (raw_sink, raw_source) =
-        chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportKind::Channel, 64);
+        chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
     let (row_sink, row_source) =
-        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportKind::Channel, 64);
+        chainscope_core::build_transport::<RowBatch>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
     let cancel = CancellationToken::new();
     let handler: Arc<dyn ReorgHandler> =
         Arc::new(DbReorgHandler::new(Arc::clone(&source), pool.clone()));

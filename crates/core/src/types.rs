@@ -14,6 +14,29 @@
 //! is the compile-time proof that the boundary is real.
 
 use bigdecimal::BigDecimal;
+use serde::{Deserialize, Serialize};
+
+/// Serialise a `BigDecimal` as its decimal string.
+///
+/// The wire format (`bincode`) is not self-describing, and `BigDecimal`'s own
+/// deserializer reads through `deserialize_any` — which a non-self-describing
+/// format cannot answer, so the default impl fails to decode. A fixed string
+/// representation sidesteps that and round-trips through any format, at the cost
+/// of a few bytes over the raw mantissa. The values are exact either way.
+mod bigdecimal_str {
+    use bigdecimal::BigDecimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S: Serializer>(value: &BigDecimal, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BigDecimal, D::Error> {
+        let text = String::deserialize(d)?;
+        BigDecimal::from_str(&text).map_err(serde::de::Error::custom)
+    }
+}
 
 /// 32-byte identifier: a block hash, a parent hash, a transaction hash.
 pub type Hash32 = [u8; 32];
@@ -22,7 +45,7 @@ pub type Hash32 = [u8; 32];
 pub type Address20 = [u8; 20];
 
 /// One undecoded log, exactly as the chain reported it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RawLog {
     pub address: Address20,
     /// `topics[0]` is the event signature; the rest are indexed parameters.
@@ -44,7 +67,7 @@ pub struct RawLog {
 ///
 /// A whole block rather than a single log, because reorg handling and cursor
 /// advancement are both per-block. Half a block is never a meaningful state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BlockUnit {
     pub number: u64,
     pub hash: Hash32,
@@ -60,7 +83,7 @@ pub struct BlockUnit {
 ///
 /// Still keyed by block for the same reason as `BlockUnit` — the writer commits
 /// exactly one block per transaction, together with the cursor.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RowBatch {
     pub block_number: u64,
     pub block_hash: Hash32,
@@ -82,7 +105,7 @@ impl RowBatch {
 /// Amounts are `BigDecimal` to match the `NUMERIC` columns. Uniswap deals in
 /// int256 and uint160, which overflow every Rust integer, and money is never
 /// floating point.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SwapRow {
     pub tx_hash: Hash32,
     pub log_index: u32,
@@ -90,14 +113,18 @@ pub struct SwapRow {
     pub sender: Address20,
     pub recipient: Address20,
     /// Signed: negative is the token leaving the pool.
+    #[serde(with = "bigdecimal_str")]
     pub amount0: BigDecimal,
+    #[serde(with = "bigdecimal_str")]
     pub amount1: BigDecimal,
+    #[serde(with = "bigdecimal_str")]
     pub sqrt_price_x96: BigDecimal,
+    #[serde(with = "bigdecimal_str")]
     pub liquidity: BigDecimal,
     pub tick: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiqKind {
     Mint,
     Burn,
@@ -115,7 +142,7 @@ impl LiqKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LiqRow {
     pub tx_hash: Hash32,
     pub log_index: u32,
@@ -124,7 +151,10 @@ pub struct LiqRow {
     pub owner: Address20,
     pub tick_lower: i32,
     pub tick_upper: i32,
+    #[serde(with = "bigdecimal_str")]
     pub amount: BigDecimal,
+    #[serde(with = "bigdecimal_str")]
     pub amount0: BigDecimal,
+    #[serde(with = "bigdecimal_str")]
     pub amount1: BigDecimal,
 }
