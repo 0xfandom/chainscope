@@ -43,3 +43,6 @@ bigdecimal.workspace = true
 # The live_pipeline test builds an EthSource against a real RPC URL and creates
 # ephemeral databases.
 url.workspace = true
+# The kafka_roundtrip test creates a throwaway topic via the admin client before
+# round-tripping through the transport. Same client the core transport uses.
+rdkafka = { version = "0.39", default-features = false, features = ["cmake-build", "tokio"] }

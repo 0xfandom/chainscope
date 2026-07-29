@@ -1251,6 +1251,7 @@ dependencies = [
  "figment",
  "hex",
  "rand 0.9.5",
+ "rdkafka",
  "serde",
  "sqlx",
  "thiserror",
