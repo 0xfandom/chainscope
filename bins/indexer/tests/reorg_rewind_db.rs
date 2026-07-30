@@ -247,7 +247,7 @@ async fn the_producer_recovers_the_canonical_branch_after_a_reorg() {
     let handler: Arc<dyn ReorgHandler> =
         Arc::new(DbReorgHandler::new(Arc::clone(&source), pool.clone()));
 
-    let (sink, mut rx) = chainscope_core::build_transport::<BlockUnit>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
+    let (sink, mut rx) = chainscope_core::build_transport::<chainscope_core::Envelope<BlockUnit>>(chainscope_core::TransportSpec::Channel { capacity: 64 }).unwrap();
     let cancel = CancellationToken::new();
     let producer = Producer::new(
         Arc::clone(&source),
@@ -266,7 +266,7 @@ async fn the_producer_recovers_the_canonical_branch_after_a_reorg() {
     // The very first block published must be the canonical block just above the
     // fork — proof the orphan (OLD_TIP+1 on our old branch) was never emitted and
     // the producer wound back.
-    let first = rx.recv().await.unwrap().unwrap().payload;
+    let first = rx.recv().await.unwrap().unwrap().payload.into_data().unwrap();
     assert_eq!(first.number, fork + 1, "resumed at the fork point, not the old tip");
     assert_eq!(first.hash, canonical.hash_at(fork + 1), "re-published the canonical branch");
 
@@ -274,7 +274,7 @@ async fn the_producer_recovers_the_canonical_branch_after_a_reorg() {
     // reorg.
     let mut last = first.number;
     while last < OLD_TIP + 1 {
-        let u = rx.recv().await.unwrap().unwrap().payload;
+        let u = rx.recv().await.unwrap().unwrap().payload.into_data().unwrap();
         assert_eq!(u.hash, canonical.hash_at(u.number), "every re-published block is canonical");
         last = u.number;
     }

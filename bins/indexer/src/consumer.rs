@@ -17,29 +17,33 @@
 
 use std::time::{Duration, Instant};
 
-use chainscope_core::{EventSource, Receipt, RowBatch};
+use chainscope_core::{Envelope, EventSource, Receipt, RowBatch};
 use sqlx::postgres::PgPool;
 use tokio::time::sleep;
 
 pub struct Writer {
     pool: PgPool,
-    source: Box<dyn EventSource<RowBatch>>,
+    source: Box<dyn EventSource<Envelope<RowBatch>>>,
     max_batch: usize,
     flush_interval: Duration,
 }
 
 /// Why a batch stopped accumulating. `Closed` means the stream ended, so flush
-/// what we have and stop; the others mean flush and keep going.
+/// what we have and stop; `Full`/`Timeout` mean flush and keep going; `Revert`
+/// means flush the data collected so far, then undo above the fork before
+/// continuing — the revert is a boundary that must not be buffered behind later
+/// data, or the undo would run out of order.
 enum BatchEnd {
     Full,
     Timeout,
     Closed,
+    Revert { from_block: u64, receipt: Receipt },
 }
 
 impl Writer {
     pub fn new(
         pool: PgPool,
-        source: Box<dyn EventSource<RowBatch>>,
+        source: Box<dyn EventSource<Envelope<RowBatch>>>,
         max_batch: usize,
         flush_interval: Duration,
     ) -> Self {
@@ -95,12 +99,31 @@ impl Writer {
 
             match end {
                 BatchEnd::Full | BatchEnd::Timeout => continue,
+                BatchEnd::Revert { from_block, receipt } => {
+                    // The data before the revert is now durably written; undo
+                    // everything above the fork, then ack the revert so its offset
+                    // commits after the undo, never before.
+                    self.apply_revert(from_block).await?;
+                    self.source.ack(receipt).await.ok();
+                    continue;
+                }
                 BatchEnd::Closed => {
                     tracing::info!(total, "stream ended; writer stopping");
                     return Ok(());
                 }
             }
         }
+    }
+
+    /// Undo this consumer's state above `from_block` in response to a revert.
+    ///
+    /// The real undo — `DELETE ... WHERE block_number > from_block` plus the
+    /// candle recompute-from-survivors, in one idempotent transaction (M4's
+    /// `rewind_to`) — lands in #60. For now the writer recognises the revert and
+    /// advances past it so the stream keeps flowing; nothing is deleted yet.
+    async fn apply_revert(&mut self, from_block: u64) -> anyhow::Result<()> {
+        tracing::warn!(from_block, "revert received; consumer-side undo lands in #60");
+        Ok(())
     }
 
     /// Fill `batch` until it is full, the flush interval elapses since the first
@@ -115,12 +138,19 @@ impl Writer {
         last_receipt: &mut Option<Receipt>,
     ) -> anyhow::Result<BatchEnd> {
         // Block until the first item. Nothing to flush until something arrives,
-        // so there is no timer yet.
+        // so there is no timer yet. A revert as the very first item returns
+        // immediately with an empty batch — the run loop flushes nothing, then
+        // applies the undo.
         match self.source.recv().await? {
-            Some(d) => {
-                batch.push(d.payload);
-                *last_receipt = Some(d.receipt);
-            }
+            Some(d) => match d.payload {
+                Envelope::Data(row) => {
+                    batch.push(row);
+                    *last_receipt = Some(d.receipt);
+                }
+                Envelope::Revert { from_block } => {
+                    return Ok(BatchEnd::Revert { from_block, receipt: d.receipt })
+                }
+            },
             None => return Ok(BatchEnd::Closed),
         }
 
@@ -136,13 +166,20 @@ impl Writer {
                 biased;
                 _ = &mut deadline => return Ok(BatchEnd::Timeout),
                 recv = self.source.recv() => match recv? {
-                    Some(d) => {
-                        batch.push(d.payload);
-                        *last_receipt = Some(d.receipt);
-                        if batch.len() >= self.max_batch {
-                            return Ok(BatchEnd::Full);
+                    Some(d) => match d.payload {
+                        Envelope::Data(row) => {
+                            batch.push(row);
+                            *last_receipt = Some(d.receipt);
+                            if batch.len() >= self.max_batch {
+                                return Ok(BatchEnd::Full);
+                            }
                         }
-                    }
+                        // Stop the batch here so the data before the revert is
+                        // written and acked first, then the undo runs in order.
+                        Envelope::Revert { from_block } => {
+                            return Ok(BatchEnd::Revert { from_block, receipt: d.receipt })
+                        }
+                    },
                     None => return Ok(BatchEnd::Closed),
                 }
             }
@@ -174,8 +211,8 @@ mod tests {
 
     /// A writer whose `collect` we drive without a database. The pool is created
     /// lazily and never connected, because `collect` never touches it.
-    fn collector(max_batch: usize, flush: Duration) -> (Box<dyn EventSink<RowBatch>>, Writer) {
-        let (sink, source) = chainscope_core::build_transport::<RowBatch>(
+    fn collector(max_batch: usize, flush: Duration) -> (Box<dyn EventSink<chainscope_core::Envelope<RowBatch>>>, Writer) {
+        let (sink, source) = chainscope_core::build_transport::<chainscope_core::Envelope<RowBatch>>(
             chainscope_core::TransportSpec::Channel { capacity: 256 },
         )
         .unwrap();
@@ -187,7 +224,7 @@ mod tests {
     async fn a_full_batch_stops_at_max_batch() {
         let (sink, mut w) = collector(3, Duration::from_secs(60));
         for n in 100..110 {
-            sink.publish(block(n)).await.unwrap();
+            sink.publish(Envelope::Data(block(n))).await.unwrap();
         }
 
         let mut batch = Vec::new();
@@ -202,8 +239,8 @@ mod tests {
     #[tokio::test]
     async fn a_partial_batch_flushes_on_the_timeout() {
         let (sink, mut w) = collector(100, Duration::from_millis(30));
-        sink.publish(block(1)).await.unwrap();
-        sink.publish(block(2)).await.unwrap();
+        sink.publish(Envelope::Data(block(1))).await.unwrap();
+        sink.publish(Envelope::Data(block(2))).await.unwrap();
 
         let mut batch = Vec::new();
         let mut r = None;
@@ -217,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_stream_still_flushes_what_it_already_has() {
         let (sink, mut w) = collector(100, Duration::from_secs(60));
-        sink.publish(block(1)).await.unwrap();
+        sink.publish(Envelope::Data(block(1))).await.unwrap();
         drop(sink); // producer finished — this is what shutdown looks like
 
         let mut batch = Vec::new();
