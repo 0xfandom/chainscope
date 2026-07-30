@@ -14,4 +14,6 @@ pub use transport::{
     build_transport, channel, ChannelSink, ChannelSource, Delivery, EventSink, EventSource,
     Receipt, TransportError, TransportKind, TransportPair, TransportSpec, Wire,
 };
-pub use types::{Address20, BlockUnit, Hash32, LiqKind, LiqRow, RawLog, RowBatch, SwapRow};
+pub use types::{
+    Address20, BlockUnit, Envelope, Hash32, LiqKind, LiqRow, RawLog, RowBatch, SwapRow,
+};
