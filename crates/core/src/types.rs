@@ -38,6 +38,49 @@ mod bigdecimal_str {
     }
 }
 
+/// What travels the seam: either a payload, or a correction.
+///
+/// Phase 1 sent bare payloads. Phase 2 (the log) cannot: a reorg cannot reach
+/// back and delete the orphaned block events already appended, so the correction
+/// has to be *another event* in the stream — `Revert { from_block }` — that each
+/// consumer reads in order and uses to undo its own state above that block. The
+/// producer records the wrong turn (the orphan blocks) and the correction after
+/// it, and total order within a partition is what lets every consumer converge.
+///
+/// Generic over the payload so both seams carry it: `Envelope<BlockUnit>` on the
+/// producer→transformer topic, `Envelope<RowBatch>` on the transformer→writer
+/// topic. The channel transport carries it too, uniformly — though under the
+/// channel a reorg is still handled by the producer-side rewind, so only the
+/// `Data` arm is ever sent there.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum Envelope<T> {
+    /// A normal payload: index it forward.
+    Data(T),
+    /// A reorg correction: every block strictly above `from_block` is orphaned,
+    /// and each consumer undoes its own state above it. `from_block` is the fork
+    /// point M4 detection finds.
+    Revert { from_block: u64 },
+}
+
+impl<T> Envelope<T> {
+    /// The payload if this is `Data`, else `None`. Convenience for call sites
+    /// (and tests) that expect a data event and treat a revert as exceptional.
+    pub fn into_data(self) -> Option<T> {
+        match self {
+            Envelope::Data(payload) => Some(payload),
+            Envelope::Revert { .. } => None,
+        }
+    }
+
+    /// Borrow the payload if this is `Data`, else `None`.
+    pub fn as_data(&self) -> Option<&T> {
+        match self {
+            Envelope::Data(payload) => Some(payload),
+            Envelope::Revert { .. } => None,
+        }
+    }
+}
+
 /// 32-byte identifier: a block hash, a parent hash, a transaction hash.
 pub type Hash32 = [u8; 32];
 

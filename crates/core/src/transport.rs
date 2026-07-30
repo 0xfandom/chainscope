@@ -40,7 +40,7 @@ use std::sync::{
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::types::{BlockUnit, RowBatch};
+use crate::types::{BlockUnit, Envelope, RowBatch};
 
 /// Failures that are the transport's fault, not the payload's.
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +141,29 @@ impl Wire for RowBatch {
     }
     fn partition_key(&self) -> Vec<u8> {
         self.block_number.to_be_bytes().to_vec()
+    }
+}
+
+/// The envelope is `Wire` whenever its payload is: encode the whole enum, and
+/// key a `Data` by its payload's key so a payload keeps the partition it would
+/// have had unwrapped. A `Revert` is chain-wide — #61 broadcasts a copy to every
+/// partition — so its key is only a fallback for a single-partition topic; key
+/// it by the fork block to stay deterministic.
+impl<T> Wire for Envelope<T>
+where
+    T: Wire + serde::Serialize + serde::de::DeserializeOwned,
+{
+    fn to_bytes(&self) -> Result<Vec<u8>, TransportError> {
+        encode(self)
+    }
+    fn from_bytes(bytes: &[u8]) -> Result<Self, TransportError> {
+        decode(bytes)
+    }
+    fn partition_key(&self) -> Vec<u8> {
+        match self {
+            Envelope::Data(payload) => payload.partition_key(),
+            Envelope::Revert { from_block } => from_block.to_be_bytes().to_vec(),
+        }
     }
 }
 
