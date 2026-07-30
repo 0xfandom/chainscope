@@ -111,11 +111,17 @@ pub async fn check_continuity(
 pub enum Continuity {
     /// The block extends the recorded chain. Publish it.
     Extends,
-    /// A reorg was found and the database was rewound to `fork_point`. The block
-    /// just fetched must not be published — it sits above a hole now — so the
-    /// producer resumes fetching from `fork_point + 1` and re-indexes the
-    /// canonical branch forward.
+    /// A reorg was found and the database was rewound to `fork_point` (phase 1,
+    /// channel transport). The block just fetched must not be published — it sits
+    /// above a hole now — so the producer resumes fetching from `fork_point + 1`
+    /// and re-indexes the canonical branch forward.
     RewoundTo { fork_point: u64 },
+    /// A reorg was found, and nothing was deleted (phase 2, log transport). The
+    /// producer must publish `Revert { from_block: fork_point }` so each consumer
+    /// undoes its own state, then resume from `fork_point + 1`. The append-only
+    /// log cannot be rewound in place, so the correction is an event, not a
+    /// `DELETE` — the distributed counterpart to `RewoundTo`.
+    EmitRevert { fork_point: u64 },
 }
 
 /// The reorg concern, as the producer sees it: hand it each freshly-fetched
@@ -158,6 +164,44 @@ impl ReorgHandler for DbReorgHandler {
                     "reorg detected; rewound to the fork point"
                 );
                 Ok(Continuity::RewoundTo { fork_point })
+            }
+        }
+    }
+}
+
+/// The phase-2 handler: detect against the recorded chain exactly as phase 1
+/// does, but on a fork touch nothing — return `EmitRevert` so the producer
+/// appends a `Revert` to the log and every consumer undoes its own state. The
+/// detection brain (`check_continuity`) is identical; only the *effect* differs,
+/// which is the whole point of doing M4 first.
+///
+/// It still reads the pool, but only to answer "does this fork, and where" — it
+/// never writes. The finalised-line guard inside `check_continuity` still bounds
+/// it, so a reorg deeper than finality surfaces as an error here too, and no
+/// consumer is ever asked to undo a finalised block.
+pub struct LogReorgHandler {
+    source: Arc<dyn ChainSource>,
+    pool: PgPool,
+}
+
+impl LogReorgHandler {
+    pub fn new(source: Arc<dyn ChainSource>, pool: PgPool) -> Self {
+        Self { source, pool }
+    }
+}
+
+#[async_trait]
+impl ReorgHandler for LogReorgHandler {
+    async fn on_block(&self, incoming: &BlockUnit) -> anyhow::Result<Continuity> {
+        match check_continuity(&*self.source, &self.pool, incoming).await? {
+            ChainCheck::Extends => Ok(Continuity::Extends),
+            ChainCheck::Forked { fork_point } => {
+                tracing::warn!(
+                    fork_point,
+                    incoming = incoming.number,
+                    "reorg detected; emitting a revert to the log (nothing deleted)"
+                );
+                Ok(Continuity::EmitRevert { fork_point })
             }
         }
     }

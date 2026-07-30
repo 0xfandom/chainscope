@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use chainscope_core::{
     source::{ChainSource, SourceError},
-    BlockUnit, EventSink,
+    BlockUnit, Envelope, EventSink,
 };
 use rand::Rng;
 use tokio_util::sync::CancellationToken;
@@ -107,7 +107,7 @@ where
 
 pub struct Producer {
     source: Arc<dyn ChainSource>,
-    sink: Box<dyn EventSink<BlockUnit>>,
+    sink: Box<dyn EventSink<Envelope<BlockUnit>>>,
     /// Where to resume. `None` means nothing has been processed yet.
     live_cursor: Option<u64>,
     /// Used only when there is no cursor. Zero means "start at the head".
@@ -123,7 +123,7 @@ pub struct Producer {
 impl Producer {
     pub fn new(
         source: Arc<dyn ChainSource>,
-        sink: Box<dyn EventSink<BlockUnit>>,
+        sink: Box<dyn EventSink<Envelope<BlockUnit>>>,
         live_cursor: Option<u64>,
         configured_start: u64,
         poll_interval: Duration,
@@ -207,14 +207,15 @@ impl Producer {
                 match self.fetch_and_publish(next).await? {
                     Published::Yes => next += 1,
 
-                    // A reorg was detected and the database rewound. The block we
-                    // just fetched sits above the hole, so it is not published;
-                    // instead we wind `next` back to the fork point and re-enter
-                    // the outer poll, which re-fetches the canonical branch
-                    // forward from there. Breaking rather than continuing re-polls
-                    // the tip, harmless since the tip is still at or above the
-                    // fork point.
-                    Published::Rewound { fork_point } => {
+                    // A reorg was detected and handled — the database rewound
+                    // (phase 1) or a revert appended to the log (phase 2). The
+                    // block we just fetched sits above the hole, so it is not
+                    // published; instead we wind `next` back to the fork point and
+                    // re-enter the outer poll, which re-fetches the canonical
+                    // branch forward from there. Breaking rather than continuing
+                    // re-polls the tip, harmless since the tip is still at or above
+                    // the fork point.
+                    Published::ForkHandled { fork_point } => {
                         tracing::warn!(
                             from = next,
                             fork_point,
@@ -280,14 +281,30 @@ impl Producer {
         };
 
         // Reorg guard (M4). Before publishing, make sure this block extends the
-        // chain we recorded. On a fork the handler has already rewound the
-        // database; we report it so the run loop resumes from the fork point
-        // rather than publishing a block whose parent no longer exists.
+        // chain we recorded. On a fork the handler either rewound the database
+        // (phase 1) or asks us to append a revert (phase 2); either way the block
+        // just fetched sits above a hole, so we report the fork and let the run
+        // loop resume from the fork point rather than publish an orphan.
         if let Some(handler) = &self.reorg {
             match handler.on_block(&unit).await? {
                 Continuity::Extends => {}
                 Continuity::RewoundTo { fork_point } => {
-                    return Ok(Published::Rewound { fork_point })
+                    return Ok(Published::ForkHandled { fork_point })
+                }
+                Continuity::EmitRevert { fork_point } => {
+                    // The log cannot be rewound in place, so the correction is an
+                    // event: consumers read it in order and undo their own state
+                    // above the fork. (#61 broadcasts a copy to every partition;
+                    // here it is a single publish.) Raced against cancellation for
+                    // the same reason the data publish below is.
+                    let sent = tokio::select! {
+                        _ = self.cancel.cancelled() => return Ok(Published::SinkClosed),
+                        r = self.sink.publish(Envelope::Revert { from_block: fork_point }) => r,
+                    };
+                    if sent.is_err() {
+                        return Ok(Published::SinkClosed);
+                    }
+                    return Ok(Published::ForkHandled { fork_point });
                 }
             }
         }
@@ -304,7 +321,7 @@ impl Producer {
         // block until the process was killed.
         tokio::select! {
             _ = self.cancel.cancelled() => Ok(Published::SinkClosed),
-            r = self.sink.publish(unit) => match r {
+            r = self.sink.publish(Envelope::Data(unit)) => match r {
                 Ok(()) => Ok(Published::Yes),
                 Err(_) => Ok(Published::SinkClosed),
             }
@@ -316,8 +333,9 @@ enum Published {
     Yes,
     NotYetAvailable,
     SinkClosed,
-    /// A reorg was handled; resume from `fork_point + 1`.
-    Rewound { fork_point: u64 },
+    /// A reorg was handled — rewound (phase 1) or reverted (phase 2). Either way,
+    /// resume from `fork_point + 1`.
+    ForkHandled { fork_point: u64 },
 }
 
 #[cfg(test)]
@@ -425,8 +443,8 @@ mod tests {
         cursor: Option<u64>,
         start: u64,
         cancel: CancellationToken,
-    ) -> (Producer, Box<dyn EventSource<BlockUnit>>) {
-        let (sink, src) = chainscope_core::build_transport::<BlockUnit>(
+    ) -> (Producer, Box<dyn EventSource<chainscope_core::Envelope<BlockUnit>>>) {
+        let (sink, src) = chainscope_core::build_transport::<chainscope_core::Envelope<BlockUnit>>(
             chainscope_core::TransportSpec::Channel { capacity: 64 },
         )
         .unwrap();
@@ -455,7 +473,7 @@ mod tests {
 
         let mut got = Vec::new();
         while got.len() < 5 {
-            got.push(rx.recv().await.unwrap().unwrap().payload.number);
+            got.push(rx.recv().await.unwrap().unwrap().payload.into_data().unwrap().number);
         }
         cancel.cancel();
         handle.await.unwrap().unwrap();
@@ -470,7 +488,7 @@ mod tests {
         let (p, mut rx) = fast_producer(MockSource::new(60), Some(50), 10, cancel.clone());
         let handle = tokio::spawn(p.run());
 
-        let first = rx.recv().await.unwrap().unwrap().payload.number;
+        let first = rx.recv().await.unwrap().unwrap().payload.into_data().unwrap().number;
         cancel.cancel();
         handle.await.unwrap().unwrap();
 
@@ -483,7 +501,7 @@ mod tests {
         let (p, mut rx) = fast_producer(MockSource::new(900), None, 0, cancel.clone());
         let handle = tokio::spawn(p.run());
 
-        let first = rx.recv().await.unwrap().unwrap().payload.number;
+        let first = rx.recv().await.unwrap().unwrap().payload.into_data().unwrap().number;
         cancel.cancel();
         handle.await.unwrap().unwrap();
 
@@ -498,7 +516,7 @@ mod tests {
         let (p, mut rx) = fast_producer(source.clone(), Some(100), 0, cancel.clone());
         let handle = tokio::spawn(p.run());
 
-        let got = rx.recv().await.unwrap().unwrap().payload.number;
+        let got = rx.recv().await.unwrap().unwrap().payload.into_data().unwrap().number;
         cancel.cancel();
         handle.await.unwrap().expect("producer must not crash");
 
@@ -535,7 +553,7 @@ mod tests {
             }
         }
 
-        let (sink, _rx) = chainscope_core::build_transport::<BlockUnit>(
+        let (sink, _rx) = chainscope_core::build_transport::<chainscope_core::Envelope<BlockUnit>>(
             chainscope_core::TransportSpec::Channel { capacity: 8 },
         )
         .unwrap();
@@ -565,7 +583,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         source.missing.lock().unwrap().clear();
 
-        let first = rx.recv().await.unwrap().unwrap().payload.number;
+        let first = rx.recv().await.unwrap().unwrap().payload.into_data().unwrap().number;
         cancel.cancel();
         handle.await.unwrap().unwrap();
 

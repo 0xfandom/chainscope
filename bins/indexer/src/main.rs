@@ -2,7 +2,7 @@
 
 use std::{process::ExitCode, sync::Arc, time::Duration};
 
-use chainscope_core::{source::ChainSource, BlockUnit, RowBatch};
+use chainscope_core::{source::ChainSource, BlockUnit, Envelope, RowBatch};
 use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
@@ -42,16 +42,12 @@ async fn main() -> anyhow::Result<ExitCode> {
     // Each seam is its own topic with its own consumer group, so the transformer
     // and the writer commit offsets independently — a distinct `group.id` per
     // seam, stable across restarts so a restart resumes rather than replays.
-    let (raw_sink, raw_source) = chainscope_core::build_transport::<BlockUnit>(transport_spec(
-        &cfg,
-        &cfg.kafka.blocks_topic,
-        "chainscope-transformer",
-    ))?;
-    let (row_sink, row_source) = chainscope_core::build_transport::<RowBatch>(transport_spec(
-        &cfg,
-        &cfg.kafka.rows_topic,
-        "chainscope-writer",
-    ))?;
+    let (raw_sink, raw_source) = chainscope_core::build_transport::<Envelope<BlockUnit>>(
+        transport_spec(&cfg, &cfg.kafka.blocks_topic, "chainscope-transformer"),
+    )?;
+    let (row_sink, row_source) = chainscope_core::build_transport::<Envelope<RowBatch>>(
+        transport_spec(&cfg, &cfg.kafka.rows_topic, "chainscope-writer"),
+    )?;
 
     // Every configured endpoint goes into one failover pool (#32). A call that
     // hits a transiently-unwell endpoint rotates to the next healthy one; the
@@ -85,10 +81,19 @@ async fn main() -> anyhow::Result<ExitCode> {
 
     let cancel = CancellationToken::new();
 
-    // The reorg guard (#46): before each block is published it is checked
-    // against the chain we have recorded, and on a fork the database is rewound
-    // to the fork point so the producer re-indexes the canonical branch forward.
-    let reorg_handler = Arc::new(reorg::DbReorgHandler::new(Arc::clone(&source), pool.clone()));
+    // The reorg guard: before each block is published it is checked against the
+    // chain we have recorded. The action on a fork depends on the transport —
+    // under the channel the database is rewound in place (M4); over the log it
+    // cannot be, so a `Revert` is appended and every consumer undoes its own
+    // state (M5). Detection is identical; only the effect differs.
+    let reorg_handler: Arc<dyn reorg::ReorgHandler> = match cfg.pipeline.transport {
+        chainscope_core::TransportKind::Channel => {
+            Arc::new(reorg::DbReorgHandler::new(Arc::clone(&source), pool.clone()))
+        }
+        chainscope_core::TransportKind::Kafka => {
+            Arc::new(reorg::LogReorgHandler::new(Arc::clone(&source), pool.clone()))
+        }
+    };
     let producer = producer::Producer::new(
         Arc::clone(&source),
         raw_sink,

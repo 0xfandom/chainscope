@@ -23,12 +23,12 @@
 
 use std::collections::HashSet;
 
-use chainscope_core::{types::Address20, BlockUnit, EventSink, EventSource, RowBatch};
+use chainscope_core::{types::Address20, BlockUnit, Envelope, EventSink, EventSource, RowBatch};
 use chainscope_eth_source::{map_log, Mapped};
 
 pub struct Transformer {
-    source: Box<dyn EventSource<BlockUnit>>,
-    sink: Box<dyn EventSink<RowBatch>>,
+    source: Box<dyn EventSource<Envelope<BlockUnit>>>,
+    sink: Box<dyn EventSink<Envelope<RowBatch>>>,
     /// Pools plus the factory. A log from anything else is not ours and is
     /// skipped before decoding; a log from one of these that fails to decode is
     /// a real gap and is counted.
@@ -41,8 +41,8 @@ pub struct Transformer {
 
 impl Transformer {
     pub fn new(
-        source: Box<dyn EventSource<BlockUnit>>,
-        sink: Box<dyn EventSink<RowBatch>>,
+        source: Box<dyn EventSource<Envelope<BlockUnit>>>,
+        sink: Box<dyn EventSink<Envelope<RowBatch>>>,
         watched: impl IntoIterator<Item = Address20>,
     ) -> Self {
         Self {
@@ -67,12 +67,18 @@ impl Transformer {
                 return Ok(());
             };
 
-            let batch = self.transform(&delivery.payload);
+            // A revert carries no logs to decode — forward it verbatim so it
+            // reaches the writer in order, ahead of the canonical replay. Decoding
+            // happens only for data blocks.
+            let out = match delivery.payload {
+                Envelope::Data(block) => Envelope::Data(self.transform(&block)),
+                Envelope::Revert { from_block } => Envelope::Revert { from_block },
+            };
 
             // Backpressure point: if the writer is behind, this suspends. If the
             // writer is gone entirely, the stream is closed and we stop — the
             // supervisor surfaces the writer's own failure, not a duplicate here.
-            if self.sink.publish(batch).await.is_err() {
+            if self.sink.publish(out).await.is_err() {
                 tracing::info!("downstream closed; transformer stopping");
                 return Ok(());
             }
@@ -205,18 +211,19 @@ mod tests {
 
     /// Build a transformer whose input and output we drive directly, plus the
     /// input sink and the output source.
+    #[allow(clippy::type_complexity)] // a test helper's return tuple, not an API
     fn harness(
         watched: Vec<Address20>,
     ) -> (
-        Box<dyn EventSink<BlockUnit>>,
+        Box<dyn EventSink<chainscope_core::Envelope<BlockUnit>>>,
         Transformer,
-        Box<dyn EventSource<RowBatch>>,
+        Box<dyn EventSource<chainscope_core::Envelope<RowBatch>>>,
     ) {
-        let (in_sink, in_source) = chainscope_core::build_transport::<BlockUnit>(
+        let (in_sink, in_source) = chainscope_core::build_transport::<chainscope_core::Envelope<BlockUnit>>(
             chainscope_core::TransportSpec::Channel { capacity: 64 },
         )
         .unwrap();
-        let (out_sink, out_source) = chainscope_core::build_transport::<RowBatch>(
+        let (out_sink, out_source) = chainscope_core::build_transport::<chainscope_core::Envelope<RowBatch>>(
             chainscope_core::TransportSpec::Channel { capacity: 64 },
         )
         .unwrap();
@@ -226,11 +233,11 @@ mod tests {
     #[tokio::test]
     async fn a_watched_swap_becomes_a_row_in_the_batch() {
         let (in_sink, t, mut out) = harness(vec![addr(POOL)]);
-        in_sink.publish(block(100, vec![swap_log()])).await.unwrap();
+        in_sink.publish(Envelope::Data(block(100, vec![swap_log()]))).await.unwrap();
         drop(in_sink);
         let handle = tokio::spawn(t.run());
 
-        let batch = out.recv().await.unwrap().unwrap().payload;
+        let batch = out.recv().await.unwrap().unwrap().payload.into_data().unwrap();
         assert_eq!(batch.block_number, 100);
         assert_eq!(batch.swaps.len(), 1);
         assert_eq!(batch.liq_events.len(), 0);
@@ -243,11 +250,11 @@ mod tests {
     async fn a_log_from_an_unwatched_contract_is_skipped() {
         // Watch a different address than the log's pool.
         let (in_sink, t, mut out) = harness(vec![addr("1111111111111111111111111111111111111111")]);
-        in_sink.publish(block(101, vec![swap_log()])).await.unwrap();
+        in_sink.publish(Envelope::Data(block(101, vec![swap_log()]))).await.unwrap();
         drop(in_sink);
         let handle = tokio::spawn(t.run());
 
-        let batch = out.recv().await.unwrap().unwrap().payload;
+        let batch = out.recv().await.unwrap().unwrap().payload.into_data().unwrap();
         // Present but empty: the block still flows so the cursor advances.
         assert_eq!(batch.block_number, 101);
         assert!(batch.swaps.is_empty() && batch.liq_events.is_empty());
@@ -258,11 +265,11 @@ mod tests {
     #[tokio::test]
     async fn an_empty_block_still_produces_a_batch() {
         let (in_sink, t, mut out) = harness(vec![addr(POOL)]);
-        in_sink.publish(block(102, vec![])).await.unwrap();
+        in_sink.publish(Envelope::Data(block(102, vec![]))).await.unwrap();
         drop(in_sink);
         let handle = tokio::spawn(t.run());
 
-        let batch = out.recv().await.unwrap().unwrap().payload;
+        let batch = out.recv().await.unwrap().unwrap().payload.into_data().unwrap();
         assert_eq!(batch.block_number, 102);
         assert!(batch.is_empty());
 
@@ -275,11 +282,11 @@ mod tests {
         unknown.topics[0] = h("dead00000000000000000000000000000000000000000000000000000000beef");
 
         let (in_sink, t, mut out) = harness(vec![addr(POOL)]);
-        in_sink.publish(block(103, vec![unknown])).await.unwrap();
+        in_sink.publish(Envelope::Data(block(103, vec![unknown]))).await.unwrap();
         drop(in_sink);
         let handle = tokio::spawn(t.run());
 
-        let batch = out.recv().await.unwrap().unwrap().payload;
+        let batch = out.recv().await.unwrap().unwrap().payload.into_data().unwrap();
         assert!(batch.is_empty(), "an undecodable event stores nothing");
 
         handle.await.unwrap().unwrap();
@@ -293,6 +300,30 @@ mod tests {
 
         // No batch, and the stream ends rather than hanging.
         assert!(out.recv().await.unwrap().is_none());
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_revert_is_forwarded_in_order_ahead_of_the_canonical_replay() {
+        let (in_sink, t, mut out) = harness(vec![addr(POOL)]);
+        // Orphan block, then the revert that corrects it, then the canonical
+        // block above the fork — the exact order a reorg produces.
+        in_sink.publish(Envelope::Data(block(200, vec![swap_log()]))).await.unwrap();
+        in_sink.publish(Envelope::Revert { from_block: 199 }).await.unwrap();
+        in_sink.publish(Envelope::Data(block(200, vec![]))).await.unwrap();
+        drop(in_sink);
+        let handle = tokio::spawn(t.run());
+
+        // The orphan decodes to a data batch...
+        let first = out.recv().await.unwrap().unwrap().payload;
+        assert!(matches!(first, Envelope::Data(ref b) if b.block_number == 200 && b.swaps.len() == 1));
+        // ...then the revert passes straight through, decoded into nothing...
+        let second = out.recv().await.unwrap().unwrap().payload;
+        assert_eq!(second, Envelope::Revert { from_block: 199 }, "revert forwarded verbatim, in order");
+        // ...ahead of the canonical replay.
+        let third = out.recv().await.unwrap().unwrap().payload;
+        assert!(matches!(third, Envelope::Data(ref b) if b.block_number == 200 && b.swaps.is_empty()));
+
         handle.await.unwrap().unwrap();
     }
 }
