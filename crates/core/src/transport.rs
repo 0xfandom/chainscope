@@ -343,9 +343,10 @@ pub mod kafka {
     use async_trait::async_trait;
     use rdkafka::{
         config::ClientConfig,
-        consumer::{Consumer, StreamConsumer},
+        consumer::{CommitMode, Consumer, StreamConsumer},
         message::Message,
         producer::{FutureProducer, FutureRecord},
+        Offset, TopicPartitionList,
     };
 
     use super::{Delivery, EventSink, EventSource, Receipt, TransportError, Wire};
@@ -414,9 +415,10 @@ pub mod kafka {
             let consumer: StreamConsumer = ClientConfig::new()
                 .set("bootstrap.servers", brokers)
                 .set("group.id", group_id)
-                // Offsets are committed by `ack`, never automatically — a commit
+                // Offsets are committed by `ack` and nowhere else — a commit
                 // before the consumer's own transaction lands would turn a crash
-                // into silent data loss. The exact commit path lands in #58.
+                // into silent data loss, so librdkafka's background auto-commit is
+                // off and `ack` commits synchronously after the durable write.
                 .set("enable.auto.commit", "false")
                 // A brand-new group with no committed offset starts at the head
                 // of the retained log, not at whatever is arriving now.
@@ -455,13 +457,25 @@ pub mod kafka {
         }
 
         async fn ack(&mut self, receipt: Receipt) -> Result<(), TransportError> {
-            // Record how far this consumer has processed. With auto-commit off
-            // this only *stores* the offset; turning stored offsets into durable,
-            // resumable commits — offset-as-cursor — is #58's job. Storing it now
-            // keeps the seam's shape right so that change is a body, not an API.
-            self.consumer
-                .store_offset(&self.topic, receipt.stream as i32, receipt.position as i64)
-                .map_err(backend)
+            // The offset is the distributed cursor. Committing it here — after the
+            // caller's own durable write has returned (the writer commits its DB
+            // transaction, then acks; see `Writer::run`) — is what makes
+            // offset-as-cursor exactly-once: a crash between the DB commit and this
+            // replays the message, and the idempotent forward apply (ON CONFLICT +
+            // RETURNING-derived state) folds the replay to nothing.
+            //
+            // A Kafka committed offset names the *next* record to read, so commit
+            // `position + 1`. Synchronous, so the resume point is durable on the
+            // broker before this returns; auto-commit stays off so nothing is ever
+            // committed ahead of a durable write.
+            let mut tpl = TopicPartitionList::new();
+            tpl.add_partition_offset(
+                &self.topic,
+                receipt.stream as i32,
+                Offset::Offset(receipt.position as i64 + 1),
+            )
+            .map_err(backend)?;
+            self.consumer.commit(&tpl, CommitMode::Sync).map_err(backend)
         }
     }
 }
