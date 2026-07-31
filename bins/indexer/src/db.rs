@@ -1371,6 +1371,77 @@ async fn reverse_pnl(tx: &mut sqlx::Transaction<'_, Postgres>, fork: i64) -> any
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Wash-trade filter (#74)
+// ---------------------------------------------------------------------------
+
+/// Thresholds for the wash-trade heuristics. All documented; conservative by
+/// default so a normal active trader is never flagged.
+#[derive(Debug, Clone)]
+pub struct WashParams {
+    /// Flag a wallet with at least this many self-trades (sender == recipient).
+    pub self_trade_min: i64,
+    /// A (wallet, pool) needs at least this many swaps to be considered churn.
+    pub churn_min_trades: i64,
+    /// …and a net position under this fraction of its gross volume — lots of
+    /// trading that nets to almost nothing, i.e. volume without exposure.
+    pub churn_net_ratio: f64,
+}
+
+impl Default for WashParams {
+    fn default() -> Self {
+        Self {
+            self_trade_min: 3,
+            churn_min_trades: 6,
+            churn_net_ratio: 0.05,
+        }
+    }
+}
+
+/// Recompute `wallet_stats.excluded` from the recent raw swaps, flagging wallets
+/// whose volume looks manufactured. Returns how many wallets are now excluded.
+///
+/// The flag is **set**, not toggled — a pure function of the surviving swaps —
+/// so re-running after a replay or reorg converges to the same answer. The flag
+/// lives on `wallet_stats` and so survives the raw swaps being pruned; the
+/// leaderboard's partial index (`WHERE excluded = FALSE`) does the exclusion.
+///
+/// Heuristics, deliberately simple, documented on [`WashParams`]:
+/// self-trading (`sender == recipient`) and churn (many trades in a pool that
+/// net to almost no position).
+pub async fn flag_wash_trading(pool: &PgPool, p: &WashParams) -> anyhow::Result<u64> {
+    sqlx::query(
+        "WITH self_trades AS (
+             SELECT recipient AS wallet FROM swaps
+              WHERE sender = recipient
+              GROUP BY recipient
+             HAVING count(*) >= $1
+         ),
+         churn AS (
+             SELECT recipient AS wallet FROM swaps
+              GROUP BY recipient, pool
+             HAVING count(*) >= $2
+                AND sum(abs(amount0)) > 0
+                AND abs(sum(amount0))::float8 < $3 * sum(abs(amount0))::float8
+         ),
+         wash AS (SELECT wallet FROM self_trades UNION SELECT wallet FROM churn)
+         UPDATE wallet_stats
+            SET excluded = (wallet IN (SELECT wallet FROM wash))",
+    )
+    .bind(p.self_trade_min)
+    .bind(p.churn_min_trades)
+    .bind(p.churn_net_ratio)
+    .execute(pool)
+    .await
+    .context("could not recompute wash-trade flags")?;
+
+    let excluded: i64 = sqlx::query_scalar("SELECT count(*) FROM wallet_stats WHERE excluded")
+        .fetch_one(pool)
+        .await
+        .context("could not count excluded wallets")?;
+    Ok(excluded as u64)
+}
+
 /// Create the day partitions the raw event tables will need shortly.
 ///
 /// Called on every startup rather than only at migration time: a process that
