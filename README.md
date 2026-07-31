@@ -70,7 +70,17 @@ docker compose ps            # postgres healthy, then indexer/api/alerter up
 ```
 
 That is the exit criterion: one command, the stack ingests, the API answers, the
-dashboard renders. To run just the database and drive a binary from the host
+dashboard renders. `ops/smoke.sh` proves it end to end — it brings the stack up,
+waits for every service's health check, then asserts `/status` and `/metrics`
+answer, Prometheus is actually scraping the API (`up == 1`), and Grafana is
+serving. One green line or a named failure:
+
+```sh
+./ops/smoke.sh              # build, up, and check
+SKIP_BUILD=1 ./ops/smoke.sh # against an already-running stack
+```
+
+To run just the database and drive a binary from the host
 instead (migrations apply on startup):
 
 ```sh
