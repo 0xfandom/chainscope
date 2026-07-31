@@ -11,29 +11,94 @@ writes, reorg-safe, resumable.
 |-------|------|
 | `crates/core` | chain-agnostic domain types, cursor, traits |
 | `crates/eth-source` | Ethereum `ChainSource` implementation + event decoders |
-| `bins/indexer` | ingestion pipeline |
-| `bins/api` | read API |
+| `bins/indexer` | ingestion pipeline: fetch → decode → PnL → retention |
+| `bins/api` | read API (pools, swaps, candles, wallet scorecards, leaderboard, `/metrics`) |
+| `bins/alerter` | Telegram alerts: watchlist moves, cluster buys, new-pool scorecards |
 
-## Status
+## What it is
 
-Early scaffold. Work in progress.
+A smart-money tracker for Uniswap V3. It follows the chain — ingest → decode →
+per-wallet PnL → a read API and Telegram alerts — and keeps its disk flat with a
+rolling retention window. The point is not another price feed; it is knowing
+*which wallets* are winning, in near real time, and being able to prove the
+number is right after a reorg.
+
+The whole system is built to be correct under two failure modes that usually get
+hand-waved: chain reorganisations, and process crashes. Every write is
+exactly-once and every derived number (PnL, candles, the leaderboard) can be
+walked backwards when a block is orphaned.
+
+## Two architectures, one seam
+
+The project's thesis is that it implements exactly-once and reorg recovery **two
+ways**, behind the same seam, switchable with one line of config.
+
+- **Phase 1 — in-process channel (M1–M4).** All stages run in one process and
+  talk over a bounded in-memory channel. Exactly-once is a single Postgres
+  transaction: the batch of rows and the cursor that names them commit together
+  or not at all. A crash can only leave "all + cursor" or "neither".
+- **Phase 2 — Redpanda log (M5).** The same stages split into separate processes
+  reading a Kafka-compatible topic. Exactly-once becomes idempotent consumers
+  keyed on offset, and a reorg is a compensating **revert event** on the log
+  rather than a rollback inside one transaction.
+
+Both satisfy the same behavioural tests. Switching is one setting in
+`chainscope.toml` — no stage is touched:
+
+```toml
+[pipeline]
+transport = "channel"   # phase 1, one process
+# transport = "redpanda"  # phase 2, distributed; brokers under docker compose
+```
+
+The seam itself (`crates/core/src/transport.rs`) is the only place either
+transport is named — enforced by `tests/seam_is_not_leaking.rs`, which fails the
+build if any other file reaches for a channel or a Kafka client directly.
 
 ## Getting started
 
-Requires Docker and a Rust toolchain.
+Everything runs under Docker — `docker compose up` builds the three binaries and
+brings up the full stack (Postgres, indexer, API, alerter, Prometheus, Grafana).
 
 ```sh
-# 1. configure
-cp .env.example .env          # edit if port 5432 is taken
+# 1. configure — set RPC endpoint(s) and, for alerts, a Telegram bot token
+cp .env.example .env
 
-# 2. bring up the database
-docker compose up -d
-docker compose ps             # postgres should report healthy
+# 2. one command up
+docker compose up -d --build
+docker compose ps            # postgres healthy, then indexer/api/alerter up
+```
 
-# 3. build and run — this applies migrations on startup
-cargo build
+That is the exit criterion: one command, the stack ingests, the API answers, the
+dashboard renders. To run just the database and drive a binary from the host
+instead (migrations apply on startup):
+
+```sh
+docker compose up -d postgres
 cargo run --bin chainscope-indexer
 ```
+
+### Endpoints
+
+Once up, the API is on `:8080` and Grafana on `:3000` (admin/admin by default).
+
+| Surface | Where |
+|---------|-------|
+| Ingest status + lag | `GET /status` |
+| Indexed pools | `GET /pools`, `GET /pools/:address` |
+| Newly discovered pools | `GET /pools/new` |
+| Pool swaps / candles | `GET /pools/:address/swaps`, `.../candles?resolution=1m\|1h\|1d` |
+| Wallet PnL scorecard | `GET /wallets/:address` |
+| Wallet realised trades | `GET /wallets/:address/trades` |
+| Smart-money leaderboard | `GET /leaderboard` |
+| Prometheus metrics | `GET /metrics` |
+| Health | `GET /healthz` |
+| Grafana dashboard | `http://localhost:3000` — ingest lag, heads, disk footprint |
+| Prometheus | `http://localhost:9090` |
+
+The alerter needs no endpoint: it polls the same database and pushes to Telegram
+when a watched wallet moves, a cluster of watched wallets buys the same pool, or
+a fresh pool clears the scorecard threshold.
 
 ## Configuration
 
@@ -271,6 +336,24 @@ docker compose exec postgres psql -U chainscope -d chainscope
 ```sh
 cargo build
 ```
+
+## Milestone map
+
+The system was built in milestones, each with a behavioural exit criterion — the
+prose sections above are the field notes for the ones that earned them.
+
+| Milestone | What it added |
+|-----------|---------------|
+| **M1** | Crash-safe ingestion: single-transaction exactly-once, cursor resume, supervised shutdown |
+| **M2** | Event decoding: swaps and liquidity events into partitioned raw tables via the same transaction |
+| **M3** | Throughput: concurrent backfill, batching, range bisection under RPC limits |
+| **M4** | Reorg recovery: fork detection, rollback of orphaned blocks and everything derived from them |
+| **M5** | Phase-2 transport: Redpanda log, stages as separate processes, idempotent consumers + revert events |
+| **M6** | Per-wallet PnL: FIFO cost basis, lot-consumption ledger for exact reorg reversal, wash-trade flagging |
+| **M7** | Read API: keyset pagination, hot-stats cache, leaderboard materialised view |
+| **M8** | Alerts + sniffer: Telegram watchlist moves, cluster buys, new-pool scorecards |
+| **M9** | Retention: live candle fold, 1m→1h→1d downsampling, partition pruning past finality, footprint metric |
+| **M10** | Ops: Prometheus `/metrics`, provisioned Grafana, Dockerfiles, one-command full-stack compose |
 
 ## License
 
