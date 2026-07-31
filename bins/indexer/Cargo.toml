@@ -17,6 +17,8 @@ path = "src/main.rs"
 # so it compiles the librdkafka client. No other crate turns this on.
 chainscope-core = { path = "../../crates/core", features = ["kafka"] }
 chainscope-eth-source = { path = "../../crates/eth-source" }
+# PnL cost-basis maths runs on NUMERIC amounts, which are BigDecimal.
+bigdecimal.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -37,9 +39,6 @@ async-trait.workspace = true
 # directory and environment and restores both afterwards — the only safe way to
 # test environment-variable layering, since the environment is process-global.
 figment = { version = "0.10", features = ["toml", "env", "test"] }
-# The writer_db integration test builds SwapRow values, whose NUMERIC amounts
-# are BigDecimal.
-bigdecimal.workspace = true
 # The live_pipeline test builds an EthSource against a real RPC URL and creates
 # ephemeral databases.
 url.workspace = true
