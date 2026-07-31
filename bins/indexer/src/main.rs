@@ -6,7 +6,7 @@ use chainscope_core::{source::ChainSource, BlockUnit, Envelope, RowBatch};
 use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
-    consumer, db, finality, maintenance, producer, reorg,
+    consumer, db, finality, maintenance, producer, reorg, sniffer,
     supervisor::{self, Shutdown, Supervisor},
     transformer,
 };
@@ -140,6 +140,17 @@ async fn main() -> anyhow::Result<ExitCode> {
         cancel.clone(),
     );
 
+    // New-pool sniffer (#103): fetch recent factory logs on a timer and record
+    // each fresh pool with a risk scorecard. Separate from the ingest pipeline,
+    // which drops PoolCreated.
+    let sniffer = sniffer::Sniffer::new(
+        Arc::clone(&source),
+        pool.clone(),
+        cfg.chain.factory.0,
+        Duration::from_millis(cfg.chain.poll_interval_ms),
+        cancel.clone(),
+    );
+
     // Every stage runs under one supervisor sharing one cancellation token.
     // Shutdown order is not scripted here: tripping the token makes the producer
     // stop and drop its sink; that closes the stream into the transformer, which
@@ -155,6 +166,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     sup.spawn("writer", writer.run());
     sup.spawn("finality", finality.run());
     sup.spawn("maintenance", maintenance.run());
+    sup.spawn("sniffer", sniffer.run());
     sup.spawn("signals", {
         let cancel = cancel.clone();
         async move {

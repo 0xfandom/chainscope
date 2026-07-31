@@ -27,6 +27,7 @@ sqlx.workspace = true
 dotenvy.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 figment.workspace = true
 hex.workspace = true
 url.workspace = true

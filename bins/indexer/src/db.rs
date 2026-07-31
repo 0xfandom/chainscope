@@ -1613,3 +1613,41 @@ pub async fn ensure_partitions(pool: &PgPool) -> anyhow::Result<i32> {
         .context("could not create day partitions")?;
     Ok(created)
 }
+
+// ---------------------------------------------------------------------------
+// New-pool capture (#103)
+// ---------------------------------------------------------------------------
+
+/// Record a pool discovered from a factory `PoolCreated`. `is_indexed = false`
+/// (discovery never widens ingestion), with a risk scorecard. Idempotent —
+/// returns whether this call inserted a new row.
+#[allow(clippy::too_many_arguments)]
+pub async fn capture_new_pool(
+    pool: &PgPool,
+    address: &Address20,
+    token0: &Address20,
+    token1: &Address20,
+    fee: i32,
+    tick_spacing: i32,
+    created_block: i64,
+    risk_flags: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO pools
+            (address, token0, token1, fee, tick_spacing, created_block, is_indexed, risk_flags)
+         VALUES ($1, $2, $3, $4, $5, $6, false, $7)
+         ON CONFLICT (address) DO NOTHING
+         RETURNING 1",
+    )
+    .bind(address.as_slice())
+    .bind(token0.as_slice())
+    .bind(token1.as_slice())
+    .bind(fee)
+    .bind(tick_spacing)
+    .bind(created_block)
+    .bind(sqlx::types::Json(risk_flags))
+    .fetch_optional(pool)
+    .await
+    .context("could not capture new pool")?;
+    Ok(inserted.is_some())
+}

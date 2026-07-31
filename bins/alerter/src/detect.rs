@@ -192,3 +192,33 @@ pub async fn cluster_buys(a: &Alerter) -> anyhow::Result<usize> {
     }
     Ok(sent)
 }
+
+/// New-pool detector: freshly discovered pools (from the sniffer) emit a risk
+/// scorecard, once each.
+pub async fn new_pools(a: &Alerter) -> anyhow::Result<usize> {
+    let rows = sqlx::query(
+        "SELECT address, token0, token1, fee, risk_flags::text AS risk
+           FROM pools WHERE is_indexed = false
+          ORDER BY discovered_at DESC LIMIT 200",
+    )
+    .fetch_all(&a.pool)
+    .await?;
+
+    let mut sent = 0;
+    for r in rows {
+        let address: Vec<u8> = r.get("address");
+        let key = format!("newpool:{}", hex0x(&address));
+        let text = format!(
+            "\u{1f195} new pool\npool {}\ntoken0 {}\ntoken1 {}\nfee {}\nrisk {}",
+            hex0x(&address),
+            hex0x(&r.get::<Vec<u8>, _>("token0")),
+            hex0x(&r.get::<Vec<u8>, _>("token1")),
+            r.get::<i32, _>("fee"),
+            r.get::<String, _>("risk"),
+        );
+        if a.dispatch(&key, &text).await? {
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
