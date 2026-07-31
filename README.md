@@ -1,369 +1,251 @@
-# chainscope
+<h1 align="center">chainscope</h1>
 
-A Uniswap V3 indexer on Ethereum mainnet, written in Rust.
+<p align="center">
+  <b>A smart-money indexer for Uniswap V3 on Ethereum.</b><br>
+  Ingest → decode → per-wallet PnL → a read API and Telegram alerts — reorg-safe,
+  exactly-once, and flat on disk. Built two ways behind one seam: an in-process
+  channel and a distributed Redpanda log.
+</p>
 
-Ingests on-chain events into Postgres and serves a read API. Exactly-once
-writes, reorg-safe, resumable.
+<p align="center">
+  <img alt="status" src="https://img.shields.io/badge/status-M1–M10%20complete-2dd4c4?labelColor=0c2630">
+  <img alt="language" src="https://img.shields.io/badge/Rust-stable-ffc56d?labelColor=0c2630">
+  <img alt="store" src="https://img.shields.io/badge/store-Postgres%2016-14f195?labelColor=0c2630">
+  <img alt="chain" src="https://img.shields.io/badge/chain-Ethereum%20mainnet-3178c6?labelColor=0c2630">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-6b7280?labelColor=0c2630">
+</p>
 
-## Workspace
+<p align="center">
+  <code>docker compose up -d</code> &nbsp;·&nbsp; API on <code>:8080</code> &nbsp;·&nbsp; Grafana on <code>:3000</code>
+</p>
 
-| Crate | Role |
-|-------|------|
-| `crates/core` | chain-agnostic domain types, cursor, traits |
-| `crates/eth-source` | Ethereum `ChainSource` implementation + event decoders |
-| `bins/indexer` | ingestion pipeline: fetch → decode → PnL → retention |
-| `bins/api` | read API (pools, swaps, candles, wallet scorecards, leaderboard, `/metrics`) |
-| `bins/alerter` | Telegram alerts: watchlist moves, cluster buys, new-pool scorecards |
+---
 
-## What it is
+## What is chainscope
 
-A smart-money tracker for Uniswap V3. It follows the chain — ingest → decode →
-per-wallet PnL → a read API and Telegram alerts — and keeps its disk flat with a
-rolling retention window. The point is not another price feed; it is knowing
-*which wallets* are winning, in near real time, and being able to prove the
-number is right after a reorg.
+chainscope follows Uniswap V3 on Ethereum mainnet and answers one question in near
+real time: **which wallets are winning.** It ingests swaps and liquidity events,
+computes each wallet's realised PnL on a FIFO cost basis, serves it over a read
+API, and pushes Telegram alerts when smart money moves.
 
-The whole system is built to be correct under two failure modes that usually get
-hand-waved: chain reorganisations, and process crashes. Every write is
-exactly-once and every derived number (PnL, candles, the leaderboard) can be
-walked backwards when a block is orphaned.
+The point is not another price feed. It is being **correct under the two failure
+modes that usually get hand-waved** — chain reorganisations and process crashes —
+so every derived number can be proven right after a block is orphaned or the
+process is killed mid-write.
+
+- **Exactly-once** — a write and the cursor that names it commit in one transaction.
+- **Reorg-safe** — orphaned blocks and everything derived from them (PnL, candles,
+  the leaderboard) are walked backwards, not left stale.
+- **Flat on disk** — raw events roll off past finality; candles and wallet
+  aggregates are the permanent record they burn into.
+
+## Who it's for
+
+| Audience | What they get |
+| --- | --- |
+| **Analysts / traders** | A live smart-money leaderboard and per-wallet PnL scorecards, wash-trade filtered. |
+| **Alert consumers** | Telegram pings on watchlist moves, coordinated cluster buys, and fresh pools clearing a scorecard. |
+| **Integrators** | A read API — pools, swaps, OHLCV candles, wallet trades, `/metrics` — with keyset pagination. |
+| **Operators** | One-command Docker stack, Prometheus metrics, and a provisioned Grafana dashboard. |
+| **Developers** | A full Rust workspace — chain source, pipeline, API, alerter — with exactly-once and reorg recovery implemented two ways to fork and study. |
+
+## The pipeline
+
+Every stage publishes to a transport seam and reads from it; none calls the next
+directly. One block of work flows through, in order:
+
+```
+producer ──[BlockUnit]──▶ transformer ──[RowBatch]──▶ writer ──▶ PnL · candles · retention
+  fetch                     decode                    exactly-once fold
+```
+
+- **producer** — walks the chain one block at a time from the stored cursor;
+  resumes rather than repeats after a restart. Typed RPC errors (`Transient`,
+  `RangeTooLarge`, `BlockNotFound`, `Fatal`) decide retry vs. stop.
+- **transformer** — decodes swaps and liquidity events into partitioned raw tables.
+- **writer** — commits each batch **and the cursor** in one transaction: exactly-once
+  by construction. PnL, candle folds and pool discovery extend that same transaction.
+- **retention** — folds candles, rolls them up (1m→1h→1d), and drops raw partitions
+  past a finality floor, keeping the footprint flat.
 
 ## Two architectures, one seam
 
-The project's thesis is that it implements exactly-once and reorg recovery **two
+chainscope's thesis is that it implements exactly-once and reorg recovery **two
 ways**, behind the same seam, switchable with one line of config.
 
-- **Phase 1 — in-process channel (M1–M4).** All stages run in one process and
-  talk over a bounded in-memory channel. Exactly-once is a single Postgres
-  transaction: the batch of rows and the cursor that names them commit together
-  or not at all. A crash can only leave "all + cursor" or "neither".
+- **Phase 1 — in-process channel (M1–M4).** All stages run in one process over a
+  bounded in-memory channel. Exactly-once is a single Postgres transaction; a crash
+  leaves "all rows + cursor" or "neither", never a half-state.
 - **Phase 2 — Redpanda log (M5).** The same stages split into separate processes
-  reading a Kafka-compatible topic. Exactly-once becomes idempotent consumers
-  keyed on offset, and a reorg is a compensating **revert event** on the log
-  rather than a rollback inside one transaction.
+  reading a Kafka-compatible topic. Exactly-once becomes idempotent consumers keyed
+  on offset, and a reorg is a compensating **revert event** on the log rather than a
+  rollback inside one transaction.
 
 Both satisfy the same behavioural tests. Switching is one setting in
 `chainscope.toml` — no stage is touched:
 
 ```toml
 [pipeline]
-transport = "channel"   # phase 1, one process
-# transport = "redpanda"  # phase 2, distributed; brokers under docker compose
+transport = "channel"    # phase 1, one process
+# transport = "redpanda"   # phase 2, distributed; brokers under docker compose
 ```
 
-The seam itself (`crates/core/src/transport.rs`) is the only place either
-transport is named — enforced by `tests/seam_is_not_leaking.rs`, which fails the
-build if any other file reaches for a channel or a Kafka client directly.
+The seam (`crates/core/src/transport.rs`) is the **only** place either transport is
+named — enforced by `tests/seam_is_not_leaking.rs`, which fails the build if any
+other file reaches for a channel or a Kafka client directly.
 
-## Getting started
+## How it works
 
-Everything runs under Docker — `docker compose up` builds the three binaries and
-brings up the full stack (Postgres, indexer, API, alerter, Prometheus, Grafana).
+Three surfaces, all from one indexed store:
 
-```sh
+- **Read** — the API answers pools, swaps, OHLCV candles, wallet scorecards and the
+  leaderboard, keyset-paginated with an opaque cursor and a hot-stats cache.
+- **Alert** — the alerter polls the same database and pushes to Telegram on a
+  watchlist move, a cluster of watched wallets buying the same pool, or a new pool
+  clearing the scorecard threshold. It is a separate process so a hung outbound call
+  can never backpressure ingestion.
+- **Observe** — Prometheus scrapes the API's `/metrics`; Grafana renders ingest lag,
+  the block heads, and the raw-vs-aggregate disk footprint M9 keeps flat.
+
+## Run it
+
+Everything runs under Docker. `docker compose up` builds the three binaries and
+brings up the full stack — Postgres, indexer, API, alerter, Prometheus, Grafana.
+
+```bash
 # 1. configure — set RPC endpoint(s) and, for alerts, a Telegram bot token
 cp .env.example .env
 
 # 2. one command up
 docker compose up -d --build
-docker compose ps            # postgres healthy, then indexer/api/alerter up
+docker compose ps                 # postgres healthy, then indexer/api/alerter up
+
+# 3. prove it end to end
+./ops/smoke.sh                    # brings up, gates every health check, asserts the surface
 ```
 
-That is the exit criterion: one command, the stack ingests, the API answers, the
-dashboard renders. `ops/smoke.sh` proves it end to end — it brings the stack up,
-waits for every service's health check, then asserts `/status` and `/metrics`
-answer, Prometheus is actually scraping the API (`up == 1`), and Grafana is
-serving. One green line or a named failure:
+`ops/smoke.sh` is the exit criterion: it waits for each service's health check, then
+asserts `/status` and `/metrics` answer, Prometheus is actually scraping the API
+(`up == 1`), and Grafana is serving — one green line or a named failure. To drive a
+binary from the host instead, run just the database (migrations apply on startup):
 
-```sh
-./ops/smoke.sh              # build, up, and check
-SKIP_BUILD=1 ./ops/smoke.sh # against an already-running stack
-```
-
-To run just the database and drive a binary from the host
-instead (migrations apply on startup):
-
-```sh
+```bash
 docker compose up -d postgres
 cargo run --bin chainscope-indexer
 ```
 
 ### Endpoints
 
-Once up, the API is on `:8080` and Grafana on `:3000` (admin/admin by default).
-
 | Surface | Where |
-|---------|-------|
+| --- | --- |
 | Ingest status + lag | `GET /status` |
-| Indexed pools | `GET /pools`, `GET /pools/:address` |
-| Newly discovered pools | `GET /pools/new` |
+| Indexed / new pools | `GET /pools`, `GET /pools/:address`, `GET /pools/new` |
 | Pool swaps / candles | `GET /pools/:address/swaps`, `.../candles?resolution=1m\|1h\|1d` |
 | Wallet PnL scorecard | `GET /wallets/:address` |
 | Wallet realised trades | `GET /wallets/:address/trades` |
 | Smart-money leaderboard | `GET /leaderboard` |
-| Prometheus metrics | `GET /metrics` |
-| Health | `GET /healthz` |
-| Grafana dashboard | `http://localhost:3000` — ingest lag, heads, disk footprint |
+| Prometheus metrics / health | `GET /metrics`, `GET /healthz` |
+| Grafana dashboard | `http://localhost:3000` (admin/admin) — lag, heads, footprint |
 | Prometheus | `http://localhost:9090` |
 
-The alerter needs no endpoint: it polls the same database and pushes to Telegram
-when a watched wallet moves, a cluster of watched wallets buys the same pool, or
-a fresh pool clears the scorecard threshold.
+## Architecture
+
+The read API and alerter are read-only consumers of the store the indexer owns:
+
+```
+   ChainSource (JSON-RPC)          ← the only thing that knows Ethereum exists
+         │  blocks + logs
+         ▼
+   indexer pipeline               ← fetch → decode → PnL → retention, exactly-once
+         │  writes
+         ▼
+   Postgres (partitioned)          ← raw events roll off; candles + PnL are permanent
+         │  read-only
+         ├────────────▶ api        ← pools, swaps, candles, scorecards, /metrics
+         └────────────▶ alerter    ← Telegram: moves, cluster buys, new pools
+```
+
+Only `crates/eth-source` knows Ethereum exists — `cargo tree -p chainscope-core`
+shows no chain library at all, the boundary enforced by the compiler rather than by
+discipline.
+
+```
+chainscope/
+├─ crates/
+│  ├─ core/          # chain-agnostic domain types, cursor, the transport seam
+│  └─ eth-source/    # the only crate that knows Ethereum: ChainSource + decoders
+├─ bins/
+│  ├─ indexer/       # ingestion pipeline: fetch → decode → PnL → retention
+│  ├─ api/           # read API (axum): keyset pagination, hot-stats cache, /metrics
+│  └─ alerter/       # Telegram alerts: watchlist moves, cluster buys, new pools
+├─ migrations/       # embedded, applied on startup
+├─ ops/              # Dockerfile helpers, prometheus.yml, grafana provisioning, smoke.sh
+└─ scripts/          # redpanda topic setup (phase 2)
+```
+
+## Testing
+
+chainscope is verified at levels that each catch what the one below can't — many
+are **behavioural**, asserting an invariant rather than a fixed output:
+
+| Level | Where | What it proves |
+| --- | --- | --- |
+| Unit | `cargo test` (per crate) | math, decoding, cursor and config logic |
+| Crash resumability | `tests/crash_resumability.rs` | kill at any point, resume gap-free — 50 randomised trials |
+| Reorg recovery | `tests/reorg_*` | orphaned blocks and their derived rows walk backwards |
+| Seam isolation | `tests/seam_is_not_leaking.rs` | no stage names a transport directly |
+| Store integration | `tests/*_db.rs` | writer, PnL, candles, retention, API against real Postgres |
+| Log transport | `tests/kafka_*` | idempotent consumers, offsets, broadcast under a storm |
+| End-to-end | `ops/smoke.sh` | one command up, stack healthy, dashboard live |
+
+The load-bearing test is `crash_resumability`: it runs the real producer and writer
+against a synthetic chain, aborts at a randomised point, restarts from the cursor,
+and asserts blocks form a gap-free run with no duplicates — and a companion test
+deliberately breaks atomicity to prove the invariant can actually fail.
+
+## Project status
+
+Every milestone is complete — **the stack comes up with one command, reaches the
+mainnet tip, and renders live on Grafana.**
+
+| Milestone | What it added |
+| --- | --- |
+| ✅ **M1** | Crash-safe ingestion: single-transaction exactly-once, cursor resume, supervised shutdown |
+| ✅ **M2** | Event decoding: swaps + liquidity events into partitioned raw tables |
+| ✅ **M3** | Throughput: concurrent backfill, batching, range bisection under RPC limits |
+| ✅ **M4** | Reorg recovery: fork detection, rollback of orphaned blocks and everything derived |
+| ✅ **M5** | Phase-2 transport: Redpanda log, separate processes, idempotent consumers + revert events |
+| ✅ **M6** | Per-wallet PnL: FIFO cost basis, lot-consumption ledger for exact reorg reversal, wash flagging |
+| ✅ **M7** | Read API: keyset pagination, hot-stats cache, leaderboard materialised view |
+| ✅ **M8** | Alerts + sniffer: Telegram watchlist moves, cluster buys, new-pool scorecards |
+| ✅ **M9** | Retention: live candle fold, 1m→1h→1d downsampling, partition pruning past finality |
+| ✅ **M10** | Ops: Prometheus `/metrics`, provisioned Grafana, Dockerfiles, one-command full-stack compose |
 
 ## Configuration
 
-Two layers. `chainscope.toml` is committed and holds everything shareable —
-chain id, pool list, tuning knobs. `.env` is not committed and holds the
-secrets: the database URL, and RPC endpoints with API keys in them.
+`chainscope.toml` is committed and holds everything shareable — chain id, pool list,
+tuning knobs. `.env` is not committed and holds the secrets: the database URL and RPC
+endpoints. Any value is overridable from the environment as
+`CHAINSCOPE_<SECTION>__<KEY>` (the environment always wins), and `DATABASE_URL` /
+`RUST_LOG` keep their conventional names.
 
-Any value in the file can be overridden from the environment as
-`CHAINSCOPE_<SECTION>__<KEY>` (double underscore between the two):
+Everything is validated before a socket opens — addresses must be 20 bytes of hex,
+the pool list non-empty and duplicate-free, unknown keys are errors — and a failure
+names the field and echoes the bad value rather than starting mis-configured.
 
-```sh
-CHAINSCOPE_PIPELINE__BATCH_SIZE=1000
-CHAINSCOPE_CHAIN__POOLS=0xaaa...,0xbbb...   # lists are comma-separated
-```
+> **RPC note (measured 2026-07-23):** free endpoints differ wildly in history depth.
+> `rpc.flashbots.net` is the best keyless option; most others cap `eth_getLogs`
+> range or want a token past ~128 blocks. Deep backfill (M3) needs a paid archive
+> endpoint; the network tests derive a recent settled block from the tip rather than
+> pinning historical block numbers, so they test the code, not a billing tier.
 
-The environment always wins. `DATABASE_URL` and `RUST_LOG` are honoured under
-their conventional unprefixed names.
+## Toolchain
 
-Everything is validated before the process opens a socket: addresses must be
-20 bytes of hex, URLs must parse and carry a sensible scheme, the pool list must
-be non-empty and free of duplicates, numbers must be inside documented bounds,
-and an unknown key is an error rather than a setting that quietly does nothing.
-A failure names the field and echoes the bad value:
-
-```
-Error: chain.pools[0]: an address is 40 hex characters after the 0x prefix (got `0xdeadbeef`)
-Error: database.url is not set. Set DATABASE_URL in .env, or database.url in chainscope.toml.
-```
-
-Startup logs a summary of the configuration it ended up with, passwords and API
-keys redacted.
-
-## Crash resumability — the M1 exit criterion
-
-M1's promise is behavioural: kill the indexer at any moment and it resumes
-correctly. `tests/crash_resumability.rs` makes that a repeatable test rather than
-a one-off manual check. It runs the real producer and writer against a
-deterministic synthetic chain, aborts the tasks at a randomised point — the
-in-process equivalent of `kill -9`, since an uncommitted transaction is simply
-dropped — restarts from the stored cursor, and repeats until the whole chain is
-stored. After every restart it asserts the invariant: blocks form a gap-free run
-from 1, no duplicates, and the cursor never runs ahead of the rows. Fifty
-randomised trials, all converging.
-
-The last criterion is the one that matters: a test that cannot fail proves
-nothing. A companion test deliberately breaks atomicity — advances the cursor
-without the rows, exactly what a non-atomic writer would leave on a crash — and
-asserts the invariant catches it (`cursor N exceeds the highest stored block`).
-
-Writing this harness surfaced a subtle bug in the harness itself, worth
-recording: the consistency check first read the blocks and the cursor in two
-separate statements. Under `READ COMMITTED` each statement takes its own
-snapshot, so a concurrently-landing atomic commit fell between the two reads and
-made a perfectly consistent database look broken. The write was always atomic;
-the check now reads both in one snapshot. The fix was in the test, not the
-pipeline — but only running it revealed that.
-
-The synthetic chain lives in `testkit` with a `branch` byte folded into every
-hash, unused in M1 — the hook M4's reorg tests will use to produce an alternate
-branch above a fork point.
-
-## Supervision and shutdown
-
-Every stage — producer, writer, signal handler — runs as a task in one
-`JoinSet` under a shared cancellation token. The supervisor enforces two things.
-
-**Shutdown is a planned crash.** Because a real crash is already safe (the
-writer's transaction guarantees exactly-once), a clean stop needs no separate
-save path. SIGINT or SIGTERM trips the token; the producer stops and drops its
-sink; that closure closes the stream; the writer drains and commits its final
-batch, cursor included, and exits. The order is not scripted — it falls out of
-the token plus the closed stream.
-
-**Partial failure is never tolerated.** A pipeline running with one dead stage
-keeps looking healthy while silently making no progress, which is worse than
-stopping. So any task that ends unexpectedly — an error, a panic, or even a
-clean return while nobody asked to stop — cancels every other stage and brings
-the process down non-zero, with the stage named in the log. A bounded
-`shutdown_timeout_ms` backs it: a stage that will not wind down cannot hang the
-process, it aborts instead.
-
-## The writer, and exactly-once
-
-The writer drains blocks from the seam, gathers them into batches, and commits
-each batch in **one transaction that also advances the cursor**. That single
-transaction is where exactly-once is manufactured: a crash can only ever leave
-the database in one of two states — the whole batch is present and the cursor
-names its last block, or none of it is and the cursor is unchanged. There is no
-state where the cursor claims progress the rows do not back up.
-
-Replaying any range is a no-op, from two things working together: block inserts
-use `ON CONFLICT (number) DO NOTHING`, and the cursor only ever moves forward
-via `GREATEST`. That is what lets crash recovery be "resume from the cursor and
-rerun" with no special cases — the re-fetched blocks simply conflict away.
-
-Batching is only for throughput; one transaction per block would be correct but
-slow. A batch flushes at `batch_size` or after `flush_interval_ms`, whichever
-comes first, so a quiet chain never holds the last few blocks unwritten. The
-cursor is advanced *only* inside that transaction, never anywhere else.
-
-When decoding (M2) and PnL (M6) arrive, they extend this same transaction, and
-must derive from the rows that actually inserted here (via `RETURNING`), not the
-incoming batch — otherwise a replay would double-count.
-
-In M1 the writer consumes `BlockUnit` directly and writes the `blocks` table.
-M2 inserts a transformer ahead of it; the writer then consumes `RowBatch` and
-the same transaction gains the decoded rows.
-
-## The producer
-
-The first stage. It reads the live cursor, walks forward one block at a time,
-and publishes each block with its logs into the seam.
-
-Sequential on purpose. Correctness and resumability first; throughput is M3's
-job and reorg detection is M4's. Every block already carries its parent hash
-even though nothing reads it yet — so when reorg detection arrives it changes
-the consumer, not the producer and not the message.
-
-**Where it starts.** A stored cursor always wins, which is what makes a restart
-resume instead of repeat. With no cursor and no configured start block, the live
-follower begins at the *current head* rather than block zero — walking all of
-history one block at a time would take years, and history belongs to the
-backfill.
-
-**Retries.** Only `Transient` errors are retried, with exponential backoff and
-full jitter. The other variants are not retryable by definition: `RangeTooLarge`
-needs a different request, `BlockNotFound` a different block, `Fatal` a human.
-Retrying them would be a busy-wait dressed up as resilience.
-
-**A block the node does not have yet** is not skipped and not hammered. The
-producer waits a poll interval and re-asks for the head — providers behind a
-load balancer disagree by a block or two, and the tip's own view is what has to
-change before the request can succeed.
-
-**Shutdown** races cancellation against both the backoff sleep and the publish,
-so stopping does not wait out a 30-second retry or a full channel. On exit the
-producer drops its sink, which closes the stream and is how the next stage
-learns to finish.
-
-## The chain boundary
-
-Everything downstream of fetching talks to a `ChainSource` — latest height,
-finalized height, one block with its logs, logs over a range, the hash at a
-height. `crates/eth-source` is the only crate that knows Ethereum exists, and
-`cargo tree -p chainscope-core` shows no chain library at all, which is the
-boundary being enforced by the compiler rather than by discipline.
-
-Errors are typed by what the caller should *do*: `Transient` (retry),
-`RangeTooLarge` (bisect and retry smaller), `BlockNotFound` (stop asking),
-`Fatal` (halt). A stringly-typed error would make every call site match on
-message text to decide, which is how a provider rewording something becomes an
-outage.
-
-Only standard JSON-RPC. Provider "enhanced" endpoints are off limits — they are
-another indexer's output, and consuming them would make our input someone
-else's opinion of the chain.
-
-### Free RPC endpoints have very different history limits
-
-Measured 2026-07-23, and it matters more than it looks: live sync only ever
-reads near the tip, but backfill does not.
-
-| Endpoint | `eth_getLogs` history |
-|---|---|
-| `rpc.flashbots.net` | deep, no key — best free option |
-| `eth.drpc.org` | a few thousand blocks |
-| `ethereum-rpc.publicnode.com` | ~128 blocks, then wants a token |
-| `1rpc.io/eth` | caps range width |
-| `eth.llamarpc.com` | returning 521 |
-| `rpc.ankr.com/eth` | now requires a key |
-
-Deep backfill (M3) needs a paid archive endpoint. The network tests avoid fixed
-historical block numbers for this reason — they derive a recent settled block
-from the tip, so they test this code rather than a billing tier.
-
-## The transport seam
-
-Stages never call each other. Each one publishes to an `EventSink` and reads
-from an `EventSource`, both defined in `crates/core`, and none of them knows
-what is underneath.
-
-```
-producer --[BlockUnit]--> transformer --[RowBatch]--> writer
-```
-
-Phase 1 is bounded in-memory channels in one process. Phase 2 (M5) is a
-Redpanda topic with the stages split into separate processes. That change is a
-new implementation of two traits plus one line of config — no stage is touched.
-
-Bounded capacity is the backpressure mechanism, not a tuning detail: when the
-writer falls behind, `publish` suspends the fetcher instead of buffering until
-the process runs out of memory. There is a test for exactly that.
-
-The seam is only worth anything if it is actually used, and the failure mode is
-quiet — someone reaches for an `mpsc::Sender` directly because it is shorter.
-`tests/seam_is_not_leaking.rs` fails the build if any file outside
-`crates/core/src/transport.rs` names a transport type.
-
-## Schema
-
-Migrations live in `migrations/` and are embedded into the binary at compile
-time, so the indexer carries its own schema and applies whatever is missing on
-startup. Running it against an already-migrated database does nothing.
-
-Three groups of tables, split by how long they live:
-
-| Group | Tables | Lifetime |
-|-------|--------|----------|
-| bookkeeping | `chain_state`, `blocks`, `alerts_sent` | small, pruned past finality |
-| raw events | `swaps`, `liq_events` | day-partitioned, rolling window, dropped by partition |
-| permanent product | `pools`, `ohlcv_*`, `wallet_positions`, `wallet_stats` | forever, and tiny |
-
-`swaps` and `liq_events` are partitioned by day on `block_time`, which is what
-makes retention a `DROP TABLE` instead of a mass `DELETE`. There is no default
-partition on purpose — an insert into a day with no partition fails loudly
-rather than piling up in a catch-all. `ensure_day_partitions()` creates the days
-ahead and runs on every startup.
-
-Data lives in the named volume `chainscope-pgdata`, so `docker compose down`
-followed by `docker compose up -d` keeps everything previously written. To wipe
-it deliberately:
-
-```sh
-docker compose down -v
-```
-
-Open a psql shell against the running container:
-
-```sh
-docker compose exec postgres psql -U chainscope -d chainscope
-```
-
-## Build
-
-```sh
-cargo build
-```
-
-## Milestone map
-
-The system was built in milestones, each with a behavioural exit criterion — the
-prose sections above are the field notes for the ones that earned them.
-
-| Milestone | What it added |
-|-----------|---------------|
-| **M1** | Crash-safe ingestion: single-transaction exactly-once, cursor resume, supervised shutdown |
-| **M2** | Event decoding: swaps and liquidity events into partitioned raw tables via the same transaction |
-| **M3** | Throughput: concurrent backfill, batching, range bisection under RPC limits |
-| **M4** | Reorg recovery: fork detection, rollback of orphaned blocks and everything derived from them |
-| **M5** | Phase-2 transport: Redpanda log, stages as separate processes, idempotent consumers + revert events |
-| **M6** | Per-wallet PnL: FIFO cost basis, lot-consumption ledger for exact reorg reversal, wash-trade flagging |
-| **M7** | Read API: keyset pagination, hot-stats cache, leaderboard materialised view |
-| **M8** | Alerts + sniffer: Telegram watchlist moves, cluster buys, new-pool scorecards |
-| **M9** | Retention: live candle fold, 1m→1h→1d downsampling, partition pruning past finality, footprint metric |
-| **M10** | Ops: Prometheus `/metrics`, provisioned Grafana, Dockerfiles, one-command full-stack compose |
+- **Rust (stable)** for the whole workspace — indexer, API, alerter, core, eth-source.
+- **Postgres 16** as the store; migrations are embedded and applied on startup.
+- **Docker + Docker Compose** for the full stack.
+- **Redpanda** (Kafka-compatible) for the phase-2 log transport.
+- **Prometheus + Grafana** for metrics and the dashboard.
 
 ## License
 
