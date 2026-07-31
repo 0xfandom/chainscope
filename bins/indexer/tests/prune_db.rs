@@ -96,7 +96,7 @@ async fn drops_old_finalized_partitions_keeps_the_rest() {
     seed_day(&pool, &old_pending, 2_000).await; // block 2000 > finalized 1000
     seed_day(&pool, &recent, 3_000).await;
 
-    let dropped = db::prune_raw_partitions(&pool, 30).await.unwrap();
+    let dropped = db::prune_raw_partitions(&pool, 30, None).await.unwrap();
 
     assert_eq!(dropped, vec![format!("swaps_{old_final}")], "only the old, finalized day");
     assert!(!exists(&pool, &format!("swaps_{old_final}")).await, "old finalized dropped");
@@ -116,8 +116,33 @@ async fn nothing_dropped_before_finality_is_known() {
     let old = day(&pool, 100).await;
     seed_day(&pool, &old, 500).await;
 
-    assert!(db::prune_raw_partitions(&pool, 30).await.unwrap().is_empty(), "no finality line -> keep all");
+    assert!(db::prune_raw_partitions(&pool, 30, None).await.unwrap().is_empty(), "no finality line -> keep all");
     assert!(exists(&pool, &format!("swaps_{old}")).await);
 
+    drop_db(&admin, pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL"]
+async fn dumps_a_partition_to_csv_before_dropping_it() {
+    let Some(admin) = admin().await else { return };
+    let (pool, name) = fresh_db(&admin).await;
+
+    let old = day(&pool, 100).await;
+    seed_day(&pool, &old, 500).await; // below finality -> will be dropped
+
+    let dir = std::env::temp_dir().join(format!("chainscope_dump_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let dropped = db::prune_raw_partitions(&pool, 30, Some(dir.as_path())).await.unwrap();
+    assert_eq!(dropped, vec![format!("swaps_{old}")]);
+
+    // The dump exists and carries the row (its block number appears in the CSV).
+    let csv = std::fs::read_to_string(dir.join(format!("swaps_{old}.csv"))).unwrap();
+    assert!(csv.contains("block_number"), "header written");
+    assert!(csv.contains("500"), "the dropped row is in the dump");
+    assert!(!exists(&pool, &format!("swaps_{old}")).await, "partition dropped after dump");
+
+    let _ = std::fs::remove_dir_all(&dir);
     drop_db(&admin, pool, &name).await;
 }

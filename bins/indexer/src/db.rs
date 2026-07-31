@@ -1779,14 +1779,52 @@ pub async fn downsample(pool: &PgPool) -> anyhow::Result<()> {
 // Partition pruner (#113)
 // ---------------------------------------------------------------------------
 
+/// Stream a partition to `<dir>/<name>.csv` via `COPY ... TO STDOUT`, written
+/// client-side so the file lands on the indexer host, not inside the database
+/// container. CSV is the portable, no-dependency choice; a Parquet writer over
+/// the same rows is a documented swap-in.
+async fn dump_partition(
+    pool: &PgPool,
+    name: &str,
+    dir: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    use futures::TryStreamExt;
+    use sqlx::postgres::PgPoolCopyExt;
+    use tokio::io::AsyncWriteExt;
+
+    tokio::fs::create_dir_all(dir).await.ok();
+    let path = dir.join(format!("{name}.csv"));
+    let mut stream = pool
+        .copy_out_raw(&format!(
+            "COPY (SELECT * FROM {name}) TO STDOUT WITH (FORMAT csv, HEADER)"
+        ))
+        .await
+        .with_context(|| format!("could not start cold dump of {name}"))?;
+    let mut file = tokio::fs::File::create(&path)
+        .await
+        .with_context(|| format!("could not create dump file for {name}"))?;
+    while let Some(chunk) = stream.try_next().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(path)
+}
+
 /// Drop raw `swaps`/`liq_events` day partitions older than `retain_days`, unless
-/// one still holds reorg-eligible blocks (above the finality line). Returns the
-/// names dropped. `DROP TABLE` is an instant catalogue update, not a row-delete.
+/// one still holds reorg-eligible blocks (above the finality line). When
+/// `dump_dir` is set, a partition is streamed to a CSV file before it is
+/// dropped, so history can leave the hot database without being lost. Returns
+/// the names dropped. `DROP TABLE` is an instant catalogue update, not a
+/// row-delete.
 ///
 /// Two guards, on purpose: the day-age window sits far above the minutes-deep
 /// finality line, and the per-partition `max(block_number)` check makes it
 /// certain no still-provisional block is ever dropped.
-pub async fn prune_raw_partitions(pool: &PgPool, retain_days: i64) -> anyhow::Result<Vec<String>> {
+pub async fn prune_raw_partitions(
+    pool: &PgPool,
+    retain_days: i64,
+    dump_dir: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<String>> {
     // The finalised line; if the pipeline has not advanced it yet, drop nothing.
     let finalized: Option<i64> =
         sqlx::query_scalar("SELECT finalized_height FROM chain_state WHERE id = 1")
@@ -1829,6 +1867,9 @@ pub async fn prune_raw_partitions(pool: &PgPool, retain_days: i64) -> anyhow::Re
                     .with_context(|| format!("could not read {name} block range"))?;
             if max_block.is_some_and(|mb| mb > finalized) {
                 continue; // still reorg-eligible — never drop
+            }
+            if let Some(dir) = dump_dir {
+                dump_partition(pool, &name, dir).await?;
             }
             sqlx::query(&format!("DROP TABLE {name}"))
                 .execute(pool)

@@ -8,6 +8,7 @@
 //! A separate supervised stage, like finality and maintenance, because it is
 //! periodic database housekeeping the ingest path should not carry.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use sqlx::postgres::PgPool;
@@ -18,15 +19,24 @@ use crate::db;
 pub struct RetentionTask {
     pool: PgPool,
     retain_days: i64,
+    /// When set, partitions are streamed to CSV here before being dropped.
+    dump_dir: Option<PathBuf>,
     interval: Duration,
     cancel: CancellationToken,
 }
 
 impl RetentionTask {
-    pub fn new(pool: PgPool, retain_days: i64, interval: Duration, cancel: CancellationToken) -> Self {
+    pub fn new(
+        pool: PgPool,
+        retain_days: i64,
+        dump_dir: Option<PathBuf>,
+        interval: Duration,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             pool,
             retain_days,
+            dump_dir,
             interval,
             cancel,
         }
@@ -35,7 +45,7 @@ impl RetentionTask {
     /// One cycle: roll candles up, then drop out-of-window raw partitions.
     pub async fn tick(&self) -> anyhow::Result<Vec<String>> {
         db::downsample(&self.pool).await?;
-        db::prune_raw_partitions(&self.pool, self.retain_days).await
+        db::prune_raw_partitions(&self.pool, self.retain_days, self.dump_dir.as_deref()).await
     }
 
     pub async fn run(self) -> anyhow::Result<()> {

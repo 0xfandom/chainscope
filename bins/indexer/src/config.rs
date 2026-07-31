@@ -220,6 +220,7 @@ struct RawPipeline {
     maintenance_interval_ms: Option<u64>,
     retention_interval_ms: Option<u64>,
     retain_days: Option<u64>,
+    cold_dump_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -299,6 +300,8 @@ pub struct Pipeline {
     pub retention_interval_ms: u64,
     /// Days of raw swaps/liq_events kept before a day partition is dropped.
     pub retain_days: u64,
+    /// If set, partitions are streamed to CSV here before being dropped.
+    pub cold_dump_dir: Option<String>,
 }
 
 /// Kafka/Redpanda transport settings (M5). Only consulted when
@@ -502,6 +505,8 @@ impl Config {
         // most ten years.
         bound("pipeline.retain_days", retain_days, 1, 3_650)?;
 
+        let cold_dump_dir = raw.pipeline.cold_dump_dir.filter(|d| !d.is_empty());
+
         let backfill_chunk_size = raw.pipeline.backfill_chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK);
         bound("pipeline.backfill_chunk_size", backfill_chunk_size, 1, 100_000)?;
 
@@ -606,6 +611,7 @@ impl Config {
                 maintenance_interval_ms,
                 retention_interval_ms,
                 retain_days,
+                cold_dump_dir,
             },
             kafka: Kafka {
                 brokers_csv: brokers.join(","),
