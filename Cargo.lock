@@ -1259,6 +1259,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bigdecimal",
+ "hex",
  "serde",
  "serde_json",
  "sqlx",

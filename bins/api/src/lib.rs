@@ -14,8 +14,11 @@ use tower_http::trace::TraceLayer;
 
 pub mod config;
 pub mod db;
+pub mod dto;
 pub mod error;
 pub mod handlers;
+pub mod pagination;
+pub mod util;
 
 /// Shared, cheaply-cloned state handed to every handler.
 #[derive(Clone)]
@@ -29,6 +32,9 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/status", get(handlers::status))
+        .route("/pools", get(handlers::list_pools))
+        .route("/pools/{address}", get(handlers::get_pool))
+        .route("/pools/{address}/swaps", get(handlers::pool_swaps))
         // A request that outlives this budget is a slow query, not a hang; cut it.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
