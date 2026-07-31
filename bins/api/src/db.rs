@@ -171,3 +171,68 @@ pub async fn swaps_page(
 
     Ok(Page { items, next_cursor })
 }
+
+// ---------------------------------------------------------------------------
+// OHLCV candles (#87)
+// ---------------------------------------------------------------------------
+
+/// Map a resolution string to its candle table. Fixed set, so formatting the
+/// name into the query is safe (no user string reaches the SQL).
+fn candle_table(resolution: &str) -> Result<&'static str, ApiError> {
+    match resolution {
+        "1m" => Ok("ohlcv_1m"),
+        "1h" => Ok("ohlcv_1h"),
+        "1d" => Ok("ohlcv_1d"),
+        _ => Err(ApiError::bad_request("resolution must be one of 1m, 1h, 1d")),
+    }
+}
+
+/// A keyset page of a pool's candles at one resolution, newest-first.
+pub async fn candles_page(
+    pool: &PgPool,
+    address: &[u8; 20],
+    resolution: &str,
+    before: Option<i64>,
+    limit: i64,
+) -> Result<Page<crate::dto::CandleDto>, ApiError> {
+    let table = candle_table(resolution)?;
+    let rows = sqlx::query(&format!(
+        "SELECT extract(epoch FROM bucket)::bigint AS bucket,
+                open::text AS open, high::text AS high, low::text AS low,
+                close::text AS close, volume0::text AS volume0,
+                volume1::text AS volume1, trade_count
+           FROM {table}
+          WHERE pool = $1
+            AND ($2::bigint IS NULL OR bucket < to_timestamp($2))
+          ORDER BY bucket DESC
+          LIMIT $3"
+    ))
+    .bind(address.as_slice())
+    .bind(before)
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let has_more = rows.len() as i64 > limit;
+    let kept = &rows[..rows.len().min(limit as usize)];
+    let items: Vec<crate::dto::CandleDto> = kept
+        .iter()
+        .map(|r| crate::dto::CandleDto {
+            bucket: r.get("bucket"),
+            open: r.get("open"),
+            high: r.get("high"),
+            low: r.get("low"),
+            close: r.get("close"),
+            volume0: r.get("volume0"),
+            volume1: r.get("volume1"),
+            trade_count: r.get("trade_count"),
+        })
+        .collect();
+
+    let next_cursor = if has_more {
+        items.last().map(|c| crate::pagination::encode_bucket(c.bucket))
+    } else {
+        None
+    };
+    Ok(Page { items, next_cursor })
+}

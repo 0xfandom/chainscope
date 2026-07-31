@@ -59,6 +59,25 @@ pub fn decode_cursor(cursor: &Option<String>) -> Result<Option<Keyset>, ApiError
     }
 }
 
+/// A single-column keyset over a candle `bucket`, carried as its unix epoch.
+pub fn encode_bucket(epoch: i64) -> String {
+    hex::encode(epoch.to_be_bytes())
+}
+
+/// Decode an optional bucket cursor into a unix epoch, or 400 if malformed.
+pub fn decode_bucket(cursor: &Option<String>) -> Result<Option<i64>, ApiError> {
+    match cursor {
+        None => Ok(None),
+        Some(c) => {
+            let bytes = hex::decode(c)
+                .ok()
+                .filter(|b| b.len() == 8)
+                .ok_or_else(|| ApiError::bad_request("malformed cursor"))?;
+            Ok(Some(i64::from_be_bytes(bytes.try_into().unwrap())))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
