@@ -26,6 +26,20 @@ pub struct PoolDto {
     pub is_indexed: bool,
 }
 
+/// One OHLCV candle.
+#[derive(Debug, Serialize)]
+pub struct CandleDto {
+    /// Interval start, unix epoch seconds.
+    pub bucket: i64,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume0: String,
+    pub volume1: String,
+    pub trade_count: i32,
+}
+
 /// One swap.
 #[derive(Debug, Serialize)]
 pub struct SwapDto {
