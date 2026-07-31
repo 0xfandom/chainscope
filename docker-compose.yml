@@ -48,6 +48,60 @@ services:
       timeout: 5s
       retries: 12
 
+  # The three chainscope processes. Each builds from the shared multi-stage
+  # Dockerfile, waits for a healthy Postgres, and takes its secrets from .env.
+  # DATABASE_URL is overridden here because .env points at localhost (for host
+  # tooling); inside the compose network the database is reached as `postgres`.
+  indexer:
+    build:
+      context: .
+      args:
+        BIN: chainscope-indexer
+    container_name: chainscope-indexer
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-chainscope}:${POSTGRES_PASSWORD:-chainscope}@postgres:5432/${POSTGRES_DB:-chainscope}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      args:
+        BIN: chainscope-api
+    container_name: chainscope-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-chainscope}:${POSTGRES_PASSWORD:-chainscope}@postgres:5432/${POSTGRES_DB:-chainscope}
+      API_BIND: 0.0.0.0:8080
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  alerter:
+    build:
+      context: .
+      args:
+        BIN: chainscope-alerter
+    container_name: chainscope-alerter
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-chainscope}:${POSTGRES_PASSWORD:-chainscope}@postgres:5432/${POSTGRES_DB:-chainscope}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   chainscope-pgdata:
     name: chainscope-pgdata
