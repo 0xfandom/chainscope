@@ -1,6 +1,14 @@
 //! chainscope read API binary.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use chainscope_api::{app, config::Config, db, AppState};
+use tokio::sync::Notify;
+
+/// Hard cap on how long graceful drain may take *after* the signal, so a stuck
+/// connection cannot hang the process past `docker compose down`'s patience.
+const DRAIN_CAP: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,9 +24,21 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %cfg.bind, "chainscope-api listening");
 
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // The signal both begins axum's graceful drain and starts the hard cap: if
+    // the drain outlives DRAIN_CAP, force the shutdown rather than hang.
+    let signalled = Arc::new(Notify::new());
+    let s2 = signalled.clone();
+    let server = axum::serve(listener, app(state)).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        s2.notify_one();
+    });
+
+    tokio::select! {
+        r = server => r?,
+        _ = async { signalled.notified().await; tokio::time::sleep(DRAIN_CAP).await; } => {
+            tracing::warn!("graceful drain exceeded {DRAIN_CAP:?}; forcing shutdown");
+        }
+    }
     Ok(())
 }
 
