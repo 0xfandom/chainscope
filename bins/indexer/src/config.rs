@@ -181,6 +181,8 @@ struct RawConfig {
     #[serde(default)]
     kafka: RawKafka,
     #[serde(default)]
+    pnl: RawPnl,
+    #[serde(default)]
     log: RawLog,
 }
 
@@ -224,6 +226,17 @@ struct RawKafka {
     retention_ms: Option<i64>,
 }
 
+/// PnL numeraire: which tokens can be valued in USD, and how. Absent = the fold
+/// is off (the plain write path), so the indexer runs without PnL until told
+/// which tokens are money.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPnl {
+    stables: Option<StringList>,
+    weth: Option<String>,
+    weth_price_pool: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLog {
@@ -240,6 +253,7 @@ pub struct Config {
     pub chain: Chain,
     pub pipeline: Pipeline,
     pub kafka: Kafka,
+    pub pnl: crate::pnl::Numeraire,
     pub log: Log,
 }
 
@@ -510,6 +524,35 @@ impl Config {
         // window); at most ~30 days (beyond that it stops being "short").
         bound("kafka.retention_ms", retention_ms.max(0) as u64, 60_000, 2_592_000_000)?;
 
+        // --- pnl numeraire ---
+        let mut stables = std::collections::HashSet::new();
+        if let Some(list) = raw.pnl.stables {
+            for (i, s) in list.0.iter().enumerate() {
+                let a = Address::parse(s)
+                    .map_err(|why| ConfigError::invalid(&format!("pnl.stables[{i}]"), s, why))?;
+                stables.insert(a.0);
+            }
+        }
+        let weth = match raw.pnl.weth {
+            Some(s) => {
+                Some(Address::parse(&s).map_err(|why| ConfigError::invalid("pnl.weth", &s, why))?.0)
+            }
+            None => None,
+        };
+        let weth_price_pool = match raw.pnl.weth_price_pool {
+            Some(s) => Some(
+                Address::parse(&s)
+                    .map_err(|why| ConfigError::invalid("pnl.weth_price_pool", &s, why))?
+                    .0,
+            ),
+            None => None,
+        };
+        let pnl = crate::pnl::Numeraire {
+            stables,
+            weth,
+            weth_price_pool,
+        };
+
         // --- log ---
         let filter = raw.log.filter.unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
 
@@ -540,6 +583,7 @@ impl Config {
                 partitions,
                 retention_ms,
             },
+            pnl,
             log: Log { filter },
         })
     }

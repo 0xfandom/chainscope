@@ -158,7 +158,7 @@ fn spawn_pipeline(pool: &PgPool, source: Arc<dyn ChainSource>, resume: Option<u6
     let producer = Producer::new(source, raw_sink, resume, START, Duration::from_millis(1), cancel.clone())
         .with_reorg_handler(handler);
     let transformer = Transformer::new(raw_source, row_sink, vec![SYNTHETIC_POOL]);
-    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(2));
+    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(2), chainscope_indexer::pnl::Numeraire::disabled());
     Pipeline {
         cancel,
         producer: tokio::spawn(producer.run()),

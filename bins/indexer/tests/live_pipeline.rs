@@ -190,7 +190,7 @@ async fn run_until_caught_up(
         cancel.clone(),
     );
     let transformer = Transformer::new(raw_source, row_sink, watched.to_vec());
-    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(200));
+    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(200), chainscope_indexer::pnl::Numeraire::disabled());
 
     let ph = tokio::spawn(producer.run());
     let th = tokio::spawn(transformer.run());

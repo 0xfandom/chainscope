@@ -21,11 +21,16 @@ use chainscope_core::{Envelope, EventSource, Receipt, RowBatch};
 use sqlx::postgres::PgPool;
 use tokio::time::sleep;
 
+use crate::pnl::Numeraire;
+
 pub struct Writer {
     pool: PgPool,
     source: Box<dyn EventSource<Envelope<RowBatch>>>,
     max_batch: usize,
     flush_interval: Duration,
+    /// Which tokens the PnL fold can price. `disabled` leaves the writer folding
+    /// no PnL — the plain write path.
+    numeraire: Numeraire,
 }
 
 /// Why a batch stopped accumulating. `Closed` means the stream ended, so flush
@@ -46,12 +51,14 @@ impl Writer {
         source: Box<dyn EventSource<Envelope<RowBatch>>>,
         max_batch: usize,
         flush_interval: Duration,
+        numeraire: Numeraire,
     ) -> Self {
         Self {
             pool,
             source,
             max_batch: max_batch.max(1),
             flush_interval,
+            numeraire,
         }
     }
 
@@ -76,7 +83,9 @@ impl Writer {
                 // duration rides on the flush log line. A real metrics backend
                 // is M10, not a reason to hold up the write path.
                 let started = Instant::now();
-                let written = crate::db::write_row_batches(&self.pool, &batch, false).await?;
+                let written =
+                    crate::db::write_row_batches_with_pnl(&self.pool, &batch, false, &self.numeraire)
+                        .await?;
                 let elapsed = started.elapsed();
                 total += written;
 
@@ -226,7 +235,8 @@ mod tests {
         )
         .unwrap();
         let pool = PgPool::connect_lazy("postgres://unused").unwrap();
-        (sink, Writer::new(pool, source, max_batch, flush))
+        // These tests exercise `collect`, which never writes, so PnL is off.
+        (sink, Writer::new(pool, source, max_batch, flush, Numeraire::disabled()))
     }
 
     #[tokio::test]
