@@ -6,7 +6,7 @@ use chainscope_core::{source::ChainSource, BlockUnit, Envelope, RowBatch};
 use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
-    consumer, db, finality, producer, reorg,
+    consumer, db, finality, maintenance, producer, reorg,
     supervisor::{self, Shutdown, Supervisor},
     transformer,
 };
@@ -132,6 +132,14 @@ async fn main() -> anyhow::Result<ExitCode> {
         cancel.clone(),
     );
 
+    // Watchlist maintenance (#100): keep the leaderboard matview and the wash
+    // flags current on a timer, so the alerter's top-N is live rather than frozen.
+    let maintenance = maintenance::MaintenanceTask::new(
+        pool.clone(),
+        Duration::from_millis(cfg.pipeline.maintenance_interval_ms),
+        cancel.clone(),
+    );
+
     // Every stage runs under one supervisor sharing one cancellation token.
     // Shutdown order is not scripted here: tripping the token makes the producer
     // stop and drop its sink; that closes the stream into the transformer, which
@@ -146,6 +154,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     sup.spawn("transformer", transformer.run());
     sup.spawn("writer", writer.run());
     sup.spawn("finality", finality.run());
+    sup.spawn("maintenance", maintenance.run());
     sup.spawn("signals", {
         let cancel = cancel.clone();
         async move {
