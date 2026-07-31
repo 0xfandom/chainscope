@@ -92,7 +92,7 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
 async fn scorecard_reports_stats_positions_and_trail() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin).await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
 
     let (st, sc) = get(&state, &format!("/wallets/{}", hex0x(&W))).await;
     assert_eq!(st, StatusCode::OK);
@@ -121,7 +121,7 @@ async fn scorecard_reports_stats_positions_and_trail() {
 async fn trades_paginate_by_keyset() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin).await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
     let base = format!("/wallets/{}/trades", hex0x(&W));
 
     let mut blocks = Vec::new();

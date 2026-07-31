@@ -14,7 +14,7 @@ use tower::ServiceExt; // oneshot
 async fn state() -> Option<AppState> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = db::connect(&url, 4).await.ok()?;
-    Some(AppState { pool })
+    Some(AppState::new(pool, std::time::Duration::ZERO))
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {

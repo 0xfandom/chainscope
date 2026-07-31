@@ -76,7 +76,7 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
 async fn candles_paginate_newest_first() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin).await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
     let base = format!("/pools/{}/candles", hex0x(&POOL));
 
     let mut buckets = Vec::new();

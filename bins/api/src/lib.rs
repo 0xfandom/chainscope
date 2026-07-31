@@ -4,6 +4,7 @@
 //! router and drive it through `tower`'s `oneshot` without binding a socket, the
 //! same lib/bin split the indexer uses.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::routing::get;
@@ -12,6 +13,7 @@ use sqlx::postgres::PgPool;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+pub mod cache;
 pub mod config;
 pub mod db;
 pub mod dto;
@@ -20,10 +22,24 @@ pub mod handlers;
 pub mod pagination;
 pub mod util;
 
+use cache::Cache;
+
 /// Shared, cheaply-cloned state handed to every handler.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub cache: Arc<Cache>,
+}
+
+impl AppState {
+    /// Build state with a hot-stats cache at the given TTL. A TTL of zero
+    /// disables caching (always live) — what the correctness tests want.
+    pub fn new(pool: PgPool, cache_ttl: Duration) -> Self {
+        Self {
+            pool,
+            cache: Arc::new(Cache::new(cache_ttl)),
+        }
+    }
 }
 
 /// Build the router. Kept separate from `main` so tests construct the exact app

@@ -101,7 +101,7 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
 async fn pools_endpoints() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin).await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
 
     let (st, list) = get(&state, "/pools").await;
     assert_eq!(st, StatusCode::OK);
@@ -127,7 +127,7 @@ async fn pools_endpoints() {
 async fn swaps_paginate_by_keyset() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin).await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
     let base = format!("/pools/{}/swaps", hex0x(&POOL));
 
     // Walk every page of size 2 and collect the block numbers seen.
