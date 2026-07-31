@@ -438,3 +438,46 @@ pub async fn new_pools_page(
     };
     Ok(Page { items, next_cursor })
 }
+
+// ---------------------------------------------------------------------------
+// Disk footprint (for /metrics, #123)
+// ---------------------------------------------------------------------------
+
+/// On-disk size split into transient raw events and permanent aggregates.
+#[derive(Debug, Default)]
+pub struct Footprint {
+    pub raw_bytes: i64,
+    pub aggregate_bytes: i64,
+}
+
+/// Measure the footprint. Raw parents are partitioned, so their day children are
+/// summed via a LIKE match; the API reads it read-only for the metrics scrape.
+pub async fn footprint(pool: &PgPool) -> Result<Footprint, ApiError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT c.relname, pg_total_relation_size(c.oid)
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public'
+            AND c.relkind IN ('r', 'p')
+            AND (c.relname IN ('swaps','liq_events','ohlcv_1m','ohlcv_1h','ohlcv_1d',
+                               'wallet_positions','wallet_stats','lot_consumptions',
+                               'pools','blocks','chain_state','alerts_sent')
+                 OR c.relname LIKE 'swaps\\_%' OR c.relname LIKE 'liq\\_events\\_%')",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut fp = Footprint::default();
+    for (name, bytes) in rows {
+        if name == "swaps"
+            || name == "liq_events"
+            || name.starts_with("swaps_")
+            || name.starts_with("liq_events_")
+        {
+            fp.raw_bytes += bytes;
+        } else {
+            fp.aggregate_bytes += bytes;
+        }
+    }
+    Ok(fp)
+}

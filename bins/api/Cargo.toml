@@ -26,6 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 bigdecimal.workspace = true
 hex.workspace = true
+prometheus = { workspace = true }
 
 [dev-dependencies]
 # Router implements tower::Service, so tests drive handlers via `oneshot`
