@@ -156,6 +156,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     let retention = retention::RetentionTask::new(
         pool.clone(),
         cfg.pipeline.retain_days as i64,
+        cfg.pipeline.cold_dump_dir.clone().map(std::path::PathBuf::from),
         Duration::from_millis(cfg.pipeline.retention_interval_ms),
         cancel.clone(),
     );

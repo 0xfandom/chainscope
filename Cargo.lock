@@ -1330,6 +1330,7 @@ dependencies = [
  "chainscope-eth-source",
  "dotenvy",
  "figment",
+ "futures",
  "hex",
  "rand 0.9.5",
  "rdkafka",
