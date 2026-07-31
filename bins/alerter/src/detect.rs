@@ -128,3 +128,67 @@ fn parse_bd(s: String) -> BigDecimal {
     use std::str::FromStr;
     BigDecimal::from_str(&s).unwrap_or_else(|_| BigDecimal::from(0))
 }
+
+/// Cluster-buy detector: when `cluster_size` or more distinct watched wallets buy
+/// the same token within a window, fire one alert.
+///
+/// Recency is bounded by a block window (cheap); the "within the window" test is
+/// the span of buy *times* per token. A growing cluster does not re-alert: the
+/// dedupe key buckets on the cluster's first-buy time, which is stable as more
+/// wallets join. Simple form — a tight sub-cluster hidden inside a wider spread
+/// of buys for the same token is missed (the span check sees the whole spread).
+pub async fn cluster_buys(a: &Alerter) -> anyhow::Result<usize> {
+    let watch = watchlist(&a.pool, a.config.watchlist_size).await?;
+    if (watch.len() as i64) < a.config.cluster_size {
+        return Ok(0);
+    }
+    let head: Option<i64> = sqlx::query_scalar("SELECT live_cursor FROM chain_state WHERE id = 1")
+        .fetch_one(&a.pool)
+        .await?;
+    // ~12s/block; scan a block window a little wider than the time window.
+    let floor = head.unwrap_or(0) - (a.config.cluster_window_secs / 12 + 100);
+    let watch_bytes: Vec<Vec<u8>> = watch.iter().map(|w| w.to_vec()).collect();
+
+    let rows = sqlx::query(
+        "WITH buys AS (
+             SELECT s.recipient AS wallet,
+                    CASE WHEN s.amount0 < 0 THEN p.token0 ELSE p.token1 END AS token,
+                    s.block_time
+               FROM swaps s
+               JOIN pools p ON p.address = s.pool
+              WHERE s.recipient = ANY($1) AND s.block_number > $2
+         )
+         SELECT token,
+                count(DISTINCT wallet) AS n,
+                extract(epoch FROM min(block_time))::bigint AS first_ts
+           FROM buys
+          GROUP BY token
+         HAVING count(DISTINCT wallet) >= $3
+            AND max(block_time) - min(block_time) <= make_interval(secs => $4)",
+    )
+    .bind(&watch_bytes)
+    .bind(floor)
+    .bind(a.config.cluster_size)
+    .bind(a.config.cluster_window_secs as f64)
+    .fetch_all(&a.pool)
+    .await?;
+
+    let mut sent = 0;
+    for r in rows {
+        let token: Vec<u8> = r.get("token");
+        let n: i64 = r.get("n");
+        let first_ts: i64 = r.get("first_ts");
+        // Bucket on the first-buy time so a cluster gaining members keeps one key.
+        let bucket = first_ts / a.config.cluster_window_secs.max(1);
+        let key = format!("cluster:{}:{}", hex0x(&token), bucket);
+        let text = format!(
+            "\u{1f41d} cluster buy\n{n} watched wallets bought {}\nwithin {}s",
+            hex0x(&token),
+            a.config.cluster_window_secs,
+        );
+        if a.dispatch(&key, &text).await? {
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}

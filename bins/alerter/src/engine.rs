@@ -33,8 +33,9 @@ impl Alerter {
     /// relies on the dedupe ledger to absorb the overlap between polls.
     async fn tick(&self) -> anyhow::Result<()> {
         let moves = crate::detect::watchlist_moves(self).await?;
-        if moves > 0 {
-            tracing::info!(moves, "watchlist moves alerted");
+        let clusters = crate::detect::cluster_buys(self).await?;
+        if moves > 0 || clusters > 0 {
+            tracing::info!(moves, clusters, "alerts fired");
         }
         Ok(())
     }
