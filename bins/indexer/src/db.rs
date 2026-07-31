@@ -1774,3 +1774,68 @@ pub async fn downsample(pool: &PgPool) -> anyhow::Result<()> {
         .context("could not roll 1h into 1d")?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Partition pruner (#113)
+// ---------------------------------------------------------------------------
+
+/// Drop raw `swaps`/`liq_events` day partitions older than `retain_days`, unless
+/// one still holds reorg-eligible blocks (above the finality line). Returns the
+/// names dropped. `DROP TABLE` is an instant catalogue update, not a row-delete.
+///
+/// Two guards, on purpose: the day-age window sits far above the minutes-deep
+/// finality line, and the per-partition `max(block_number)` check makes it
+/// certain no still-provisional block is ever dropped.
+pub async fn prune_raw_partitions(pool: &PgPool, retain_days: i64) -> anyhow::Result<Vec<String>> {
+    // The finalised line; if the pipeline has not advanced it yet, drop nothing.
+    let finalized: Option<i64> =
+        sqlx::query_scalar("SELECT finalized_height FROM chain_state WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .context("could not read the finality line")?;
+    let Some(finalized) = finalized else {
+        return Ok(Vec::new());
+    };
+
+    // Cutoff day, computed in SQL so no calendar maths lives in Rust. Partition
+    // names end in YYYYMMDD, which sorts chronologically as text.
+    let cutoff: String = sqlx::query_scalar("SELECT to_char(current_date - $1::int, 'YYYYMMDD')")
+        .bind(retain_days as i32)
+        .fetch_one(pool)
+        .await?;
+
+    let mut dropped = Vec::new();
+    for parent in ["swaps", "liq_events"] {
+        let parts: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname
+               FROM pg_inherits i
+               JOIN pg_class c ON c.oid = i.inhrelid
+              WHERE i.inhparent = $1::regclass",
+        )
+        .bind(parent)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("could not list {parent} partitions"))?;
+
+        for name in parts {
+            let Some(day) = name.rsplit('_').next() else { continue };
+            if day.len() != 8 || day >= cutoff.as_str() {
+                continue; // malformed, or still inside the retention window
+            }
+            let max_block: Option<i64> =
+                sqlx::query_scalar(&format!("SELECT max(block_number) FROM {name}"))
+                    .fetch_one(pool)
+                    .await
+                    .with_context(|| format!("could not read {name} block range"))?;
+            if max_block.is_some_and(|mb| mb > finalized) {
+                continue; // still reorg-eligible — never drop
+            }
+            sqlx::query(&format!("DROP TABLE {name}"))
+                .execute(pool)
+                .await
+                .with_context(|| format!("could not drop {name}"))?;
+            dropped.push(name);
+        }
+    }
+    Ok(dropped)
+}

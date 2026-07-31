@@ -6,7 +6,7 @@ use chainscope_core::{source::ChainSource, BlockUnit, Envelope, RowBatch};
 use chainscope_eth_source::PooledSource;
 use chainscope_indexer::{
     config::Config,
-    consumer, db, finality, maintenance, producer, reorg, sniffer,
+    consumer, db, finality, maintenance, producer, reorg, retention, sniffer,
     supervisor::{self, Shutdown, Supervisor},
     transformer,
 };
@@ -151,6 +151,15 @@ async fn main() -> anyhow::Result<ExitCode> {
         cancel.clone(),
     );
 
+    // Retention (#113): roll candles up and drop out-of-window raw partitions on
+    // a timer, keeping the disk footprint flat.
+    let retention = retention::RetentionTask::new(
+        pool.clone(),
+        cfg.pipeline.retain_days as i64,
+        Duration::from_millis(cfg.pipeline.retention_interval_ms),
+        cancel.clone(),
+    );
+
     // Every stage runs under one supervisor sharing one cancellation token.
     // Shutdown order is not scripted here: tripping the token makes the producer
     // stop and drop its sink; that closes the stream into the transformer, which
@@ -167,6 +176,7 @@ async fn main() -> anyhow::Result<ExitCode> {
     sup.spawn("finality", finality.run());
     sup.spawn("maintenance", maintenance.run());
     sup.spawn("sniffer", sniffer.run());
+    sup.spawn("retention", retention.run());
     sup.spawn("signals", {
         let cancel = cancel.clone();
         async move {
