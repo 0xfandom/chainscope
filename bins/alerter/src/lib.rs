@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod db;
+pub mod detect;
 pub mod engine;
 pub mod notify;
 
