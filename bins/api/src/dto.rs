@@ -26,6 +26,31 @@ pub struct PoolDto {
     pub is_indexed: bool,
 }
 
+/// One leaderboard entry.
+#[derive(Debug, Serialize)]
+pub struct LeaderRowDto {
+    pub wallet: String,
+    pub realized_pnl_usd: String,
+    pub trades: i32,
+    pub wins: i32,
+    pub volume_usd: String,
+}
+
+/// A recently discovered pool.
+#[derive(Debug, Serialize)]
+pub struct NewPoolDto {
+    pub address: String,
+    pub token0: String,
+    pub token1: String,
+    pub fee: i32,
+    pub token0_symbol: Option<String>,
+    pub token1_symbol: Option<String>,
+    pub created_block: Option<i64>,
+    /// Discovery time, unix epoch seconds.
+    pub discovered_at: i64,
+    pub is_indexed: bool,
+}
+
 /// A wallet's still-open position in one token.
 #[derive(Debug, Serialize)]
 pub struct OpenPositionDto {

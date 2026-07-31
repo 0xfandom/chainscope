@@ -356,3 +356,85 @@ pub async fn wallet_trades_page(
     };
     Ok(Page { items, next_cursor })
 }
+
+// ---------------------------------------------------------------------------
+// Leaderboard and new pools (#89)
+// ---------------------------------------------------------------------------
+
+use crate::dto::{LeaderRowDto, NewPoolDto};
+
+/// The watchlist: top wallets by realised PnL, wash-excluded, from the matview.
+///
+/// The materialised view ships `WITH NO DATA`, so before its first refresh a
+/// SELECT raises `55000` (object not in prerequisite state). That is "no
+/// watchlist yet", not an error to the client — return an empty list.
+pub async fn leaderboard(pool: &PgPool, limit: i64) -> Result<Vec<LeaderRowDto>, ApiError> {
+    let result = sqlx::query(
+        "SELECT wallet, realized_pnl_usd::text AS pnl, trades, wins, volume_usd::text AS volume \
+           FROM leaderboard ORDER BY realized_pnl_usd DESC LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await;
+
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("55000") => {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok(rows
+        .iter()
+        .map(|r| LeaderRowDto {
+            wallet: hex0x(&r.get::<Vec<u8>, _>("wallet")),
+            realized_pnl_usd: r.get("pnl"),
+            trades: r.get("trades"),
+            wins: r.get("wins"),
+            volume_usd: r.get("volume"),
+        })
+        .collect())
+}
+
+/// Recently discovered pools, newest-first, keyset-paginated on discovery time.
+pub async fn new_pools_page(
+    pool: &PgPool,
+    before: Option<i64>,
+    limit: i64,
+) -> Result<Page<NewPoolDto>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT address, token0, token1, fee, token0_symbol, token1_symbol, created_block, \
+                extract(epoch FROM discovered_at)::bigint AS discovered_at, is_indexed \
+           FROM pools \
+          WHERE ($1::bigint IS NULL OR discovered_at < to_timestamp($1)) \
+          ORDER BY discovered_at DESC \
+          LIMIT $2",
+    )
+    .bind(before)
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let has_more = rows.len() as i64 > limit;
+    let items: Vec<NewPoolDto> = rows[..rows.len().min(limit as usize)]
+        .iter()
+        .map(|r| NewPoolDto {
+            address: hex0x(&r.get::<Vec<u8>, _>("address")),
+            token0: hex0x(&r.get::<Vec<u8>, _>("token0")),
+            token1: hex0x(&r.get::<Vec<u8>, _>("token1")),
+            fee: r.get("fee"),
+            token0_symbol: r.get("token0_symbol"),
+            token1_symbol: r.get("token1_symbol"),
+            created_block: r.get("created_block"),
+            discovered_at: r.get("discovered_at"),
+            is_indexed: r.get("is_indexed"),
+        })
+        .collect();
+    let next_cursor = if has_more {
+        items.last().map(|p| crate::pagination::encode_bucket(p.discovered_at))
+    } else {
+        None
+    };
+    Ok(Page { items, next_cursor })
+}
