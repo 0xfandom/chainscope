@@ -102,3 +102,28 @@ pub async fn wallet_trades(
     let limit = clamp_limit(params.limit);
     Ok(Json(db::wallet_trades_page(&state.pool, &addr, after, limit).await?))
 }
+
+/// Query params for limit-only endpoints.
+#[derive(Debug, Deserialize)]
+pub struct LimitParams {
+    pub limit: Option<u32>,
+}
+
+/// The smart-money watchlist: top wallets by realised PnL, wash-excluded.
+pub async fn leaderboard(
+    State(state): State<AppState>,
+    Query(params): Query<LimitParams>,
+) -> Result<Json<Vec<crate::dto::LeaderRowDto>>, ApiError> {
+    let limit = clamp_limit(params.limit);
+    Ok(Json(db::leaderboard(&state.pool, limit).await?))
+}
+
+/// Recently discovered pools, keyset-paginated on discovery time.
+pub async fn new_pools(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<Page<crate::dto::NewPoolDto>>, ApiError> {
+    let before = decode_bucket(&params.cursor)?;
+    let limit = clamp_limit(params.limit);
+    Ok(Json(db::new_pools_page(&state.pool, before, limit).await?))
+}
