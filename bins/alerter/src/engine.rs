@@ -34,8 +34,9 @@ impl Alerter {
     async fn tick(&self) -> anyhow::Result<()> {
         let moves = crate::detect::watchlist_moves(self).await?;
         let clusters = crate::detect::cluster_buys(self).await?;
-        if moves > 0 || clusters > 0 {
-            tracing::info!(moves, clusters, "alerts fired");
+        let pools = crate::detect::new_pools(self).await?;
+        if moves > 0 || clusters > 0 || pools > 0 {
+            tracing::info!(moves, clusters, pools, "alerts fired");
         }
         Ok(())
     }
