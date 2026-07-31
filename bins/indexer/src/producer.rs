@@ -294,12 +294,13 @@ impl Producer {
                 Continuity::EmitRevert { fork_point } => {
                     // The log cannot be rewound in place, so the correction is an
                     // event: consumers read it in order and undo their own state
-                    // above the fork. (#61 broadcasts a copy to every partition;
-                    // here it is a single publish.) Raced against cancellation for
-                    // the same reason the data publish below is.
+                    // above the fork. Broadcast, not publish — the orphaned blocks
+                    // hold trades scattered across every partition, so the revert
+                    // must reach all of them. Raced against cancellation for the
+                    // same reason the data publish below is.
                     let sent = tokio::select! {
                         _ = self.cancel.cancelled() => return Ok(Published::SinkClosed),
-                        r = self.sink.publish(Envelope::Revert { from_block: fork_point }) => r,
+                        r = self.sink.broadcast(Envelope::Revert { from_block: fork_point }) => r,
                     };
                     if sent.is_err() {
                         return Ok(Published::SinkClosed);
