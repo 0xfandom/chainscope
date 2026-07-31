@@ -48,6 +48,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handlers::healthz))
         .route("/status", get(handlers::status))
+        .route("/metrics", get(handlers::metrics))
         .route("/pools", get(handlers::list_pools))
         .route("/pools/new", get(handlers::new_pools))
         .route("/pools/{address}", get(handlers::get_pool))
