@@ -180,6 +180,23 @@ pub trait EventSink<T>: Send + Sync {
     /// mechanism: a fetcher that outruns the writer gets slowed down instead of
     /// growing a queue until the process dies.
     async fn publish(&self, batch: T) -> Result<(), TransportError>;
+
+    /// Publish a copy to *every* partition — a chain-wide broadcast.
+    ///
+    /// A reorg is defined by block number, and its orphaned blocks hold events
+    /// from many pools scattered across every partition, so the revert that
+    /// corrects it has to reach all of them: a revert on one partition would
+    /// leave every other pool's consumer believing nothing happened. The default
+    /// is a single `publish`, which is exactly right for a transport with one
+    /// logical partition (the channel); the log overrides it to fan out.
+    ///
+    /// Consumers apply the per-partition copies idempotently, so a consumer that
+    /// owns several partitions seeing "the same" logical revert once per
+    /// partition is correct, not a double-undo.
+    ///
+    /// A transport with one logical partition (the channel) implements this as a
+    /// single `publish`; the log fans out.
+    async fn broadcast(&self, batch: T) -> Result<(), TransportError>;
 }
 
 /// The consuming half of the seam.
@@ -250,6 +267,13 @@ impl<T: Send + 'static> EventSink<T> for ChannelSink<T> {
             })
             .await
             .map_err(|_| TransportError::Closed)
+    }
+
+    async fn broadcast(&self, batch: T) -> Result<(), TransportError> {
+        // One process, one logical partition, one consumer: a broadcast is just
+        // a publish. The single consumer reads the revert in order and undoes its
+        // state — there are no other partitions to reach.
+        self.publish(batch).await
     }
 }
 
@@ -368,7 +392,7 @@ pub mod kafka {
         config::ClientConfig,
         consumer::{CommitMode, Consumer, StreamConsumer},
         message::Message,
-        producer::{FutureProducer, FutureRecord},
+        producer::{FutureProducer, FutureRecord, Producer},
         Offset, TopicPartitionList,
     };
 
@@ -412,6 +436,29 @@ pub mod kafka {
         }
     }
 
+    impl<T: Wire> KafkaSink<T> {
+        /// The topic's current partition count, from cluster metadata. Fetched
+        /// per broadcast rather than cached because a broadcast is rare (only a
+        /// reorg triggers one) and the count is authoritative from the broker,
+        /// so a topic created with a different partition count than config still
+        /// fans out correctly.
+        fn partition_count(&self) -> Result<i32, TransportError> {
+            let metadata = self
+                .producer
+                .client()
+                .fetch_metadata(Some(&self.topic), Duration::from_secs(10))
+                .map_err(backend)?;
+            let topic = metadata
+                .topics()
+                .iter()
+                .find(|t| t.name() == self.topic)
+                .ok_or_else(|| {
+                    TransportError::Backend(format!("topic {} not found in metadata", self.topic))
+                })?;
+            Ok(topic.partitions().len() as i32)
+        }
+    }
+
     #[async_trait]
     impl<T: Wire> EventSink<T> for KafkaSink<T> {
         async fn publish(&self, batch: T) -> Result<(), TransportError> {
@@ -422,6 +469,27 @@ pub mod kafka {
                 .send(record, PUBLISH_TIMEOUT)
                 .await
                 .map_err(|(e, _owned_message)| backend(e))?;
+            Ok(())
+        }
+
+        async fn broadcast(&self, batch: T) -> Result<(), TransportError> {
+            // Write one copy of the payload to each partition explicitly, by
+            // partition number rather than by key — so the revert lands on every
+            // partition regardless of how the key would have hashed. Each
+            // partition's consumer then reads its own copy in order relative to
+            // that partition's data, and undoes its pool's rows above the fork.
+            let payload = batch.to_bytes()?;
+            let key = batch.partition_key();
+            for partition in 0..self.partition_count()? {
+                let record = FutureRecord::to(&self.topic)
+                    .payload(&payload)
+                    .key(&key)
+                    .partition(partition);
+                self.producer
+                    .send(record, PUBLISH_TIMEOUT)
+                    .await
+                    .map_err(|(e, _owned_message)| backend(e))?;
+            }
             Ok(())
         }
     }
