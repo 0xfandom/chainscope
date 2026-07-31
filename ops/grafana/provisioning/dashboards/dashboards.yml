@@ -1,0 +1,15 @@
+# Grafana dashboard provider: load every dashboard JSON dropped into the
+# mounted folder at startup, so the chainscope dashboard is present without a
+# manual import.
+apiVersion: 1
+
+providers:
+  - name: chainscope
+    orgId: 1
+    folder: chainscope
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

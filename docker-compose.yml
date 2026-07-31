@@ -102,8 +102,47 @@ services:
       postgres:
         condition: service_healthy
 
+  # Observability (M10). Prometheus scrapes the API's /metrics; Grafana ships
+  # with the datasource and the chainscope dashboard already provisioned, so
+  # `docker compose up` yields a working dashboard with no manual import.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: chainscope-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - chainscope-prometheus:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: chainscope-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - chainscope-grafana:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      - prometheus
+
 volumes:
   chainscope-pgdata:
     name: chainscope-pgdata
   chainscope-redpanda:
     name: chainscope-redpanda
+  chainscope-prometheus:
+    name: chainscope-prometheus
+  chainscope-grafana:
+    name: chainscope-grafana

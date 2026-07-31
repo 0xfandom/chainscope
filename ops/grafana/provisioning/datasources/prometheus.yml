@@ -1,0 +1,12 @@
+# Grafana datasource provisioning: the Prometheus service is the default (and
+# only) source, reached by its compose service name on the shared network.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
