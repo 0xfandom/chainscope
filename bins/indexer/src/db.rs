@@ -1724,3 +1724,53 @@ pub async fn capture_new_pool(
     .context("could not capture new pool")?;
     Ok(inserted.is_some())
 }
+
+// ---------------------------------------------------------------------------
+// Candle downsampler (#112)
+// ---------------------------------------------------------------------------
+
+// Roll finer candles up into a coarser table. open = earliest fine bucket's
+// open, close = latest fine bucket's close, high/low widen, volumes and counts
+// sum. Only *complete* coarse buckets are rolled (strictly before the current
+// coarse interval), so a still-filling bucket is never frozen half-done. On
+// conflict the coarse row is *recomputed* (set from EXCLUDED, not accumulated),
+// so re-running over the same fine set is idempotent; once the fine rows are
+// pruned, the coarse group is empty and the existing coarse row is left as-is.
+fn roll_sql(src: &str, dst: &str, unit: &str) -> String {
+    format!(
+        "INSERT INTO {dst} (pool, bucket, open, high, low, close, volume0, volume1, trade_count)
+         SELECT pool,
+                date_trunc('{unit}', bucket) AS b,
+                (array_agg(open ORDER BY bucket))[1]        AS open,
+                max(high) AS high,
+                min(low)  AS low,
+                (array_agg(close ORDER BY bucket DESC))[1]  AS close,
+                sum(volume0) AS volume0,
+                sum(volume1) AS volume1,
+                sum(trade_count) AS trade_count
+           FROM {src}
+          WHERE bucket < date_trunc('{unit}', now())
+          GROUP BY pool, date_trunc('{unit}', bucket)
+         ON CONFLICT (pool, bucket) DO UPDATE SET
+             open        = EXCLUDED.open,
+             high        = EXCLUDED.high,
+             low         = EXCLUDED.low,
+             close       = EXCLUDED.close,
+             volume0     = EXCLUDED.volume0,
+             volume1     = EXCLUDED.volume1,
+             trade_count = EXCLUDED.trade_count"
+    )
+}
+
+/// Roll 1m candles into 1h and 1h into 1d. Idempotent; only complete buckets.
+pub async fn downsample(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(&roll_sql("ohlcv_1m", "ohlcv_1h", "hour"))
+        .execute(pool)
+        .await
+        .context("could not roll 1m into 1h")?;
+    sqlx::query(&roll_sql("ohlcv_1h", "ohlcv_1d", "day"))
+        .execute(pool)
+        .await
+        .context("could not roll 1h into 1d")?;
+    Ok(())
+}
