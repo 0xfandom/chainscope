@@ -56,6 +56,8 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 4_000;
 // commit just replays next start.
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MAINTENANCE_INTERVAL_MS: u64 = 60_000;
+const DEFAULT_RETENTION_INTERVAL_MS: u64 = 3_600_000;
+const DEFAULT_RETAIN_DAYS: u64 = 30;
 const DEFAULT_LOG_FILTER: &str = "info";
 
 // ---------------------------------------------------------------------------
@@ -216,6 +218,8 @@ struct RawPipeline {
     backfill_chunk_size: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
     maintenance_interval_ms: Option<u64>,
+    retention_interval_ms: Option<u64>,
+    retain_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -291,6 +295,10 @@ pub struct Pipeline {
     pub shutdown_timeout_ms: u64,
     /// How often the watchlist maintenance stage refreshes the leaderboard.
     pub maintenance_interval_ms: u64,
+    /// How often the retention stage rolls candles and prunes raw partitions.
+    pub retention_interval_ms: u64,
+    /// Days of raw swaps/liq_events kept before a day partition is dropped.
+    pub retain_days: u64,
 }
 
 /// Kafka/Redpanda transport settings (M5). Only consulted when
@@ -483,6 +491,17 @@ impl Config {
             .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_MS);
         bound("pipeline.maintenance_interval_ms", maintenance_interval_ms, 1_000, 3_600_000)?;
 
+        let retention_interval_ms = raw
+            .pipeline
+            .retention_interval_ms
+            .unwrap_or(DEFAULT_RETENTION_INTERVAL_MS);
+        bound("pipeline.retention_interval_ms", retention_interval_ms, 1_000, 86_400_000)?;
+
+        let retain_days = raw.pipeline.retain_days.unwrap_or(DEFAULT_RETAIN_DAYS);
+        // At least a day (comfortably above the minutes-deep finality line), at
+        // most ten years.
+        bound("pipeline.retain_days", retain_days, 1, 3_650)?;
+
         let backfill_chunk_size = raw.pipeline.backfill_chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK);
         bound("pipeline.backfill_chunk_size", backfill_chunk_size, 1, 100_000)?;
 
@@ -585,6 +604,8 @@ impl Config {
                 backfill_chunk_size,
                 shutdown_timeout_ms,
                 maintenance_interval_ms,
+                retention_interval_ms,
+                retain_days,
             },
             kafka: Kafka {
                 brokers_csv: brokers.join(","),

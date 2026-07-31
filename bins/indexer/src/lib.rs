@@ -16,6 +16,7 @@ pub mod maintenance;
 pub mod pnl;
 pub mod producer;
 pub mod reorg;
+pub mod retention;
 pub mod sniffer;
 pub mod supervisor;
 pub mod testkit;
