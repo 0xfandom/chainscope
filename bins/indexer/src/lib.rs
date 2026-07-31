@@ -12,6 +12,7 @@ pub mod config;
 pub mod consumer;
 pub mod db;
 pub mod finality;
+pub mod maintenance;
 pub mod pnl;
 pub mod producer;
 pub mod reorg;

@@ -55,6 +55,7 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 4_000;
 // because the writer may be mid-commit when the signal lands and a killed
 // commit just replays next start.
 const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_MAINTENANCE_INTERVAL_MS: u64 = 60_000;
 const DEFAULT_LOG_FILTER: &str = "info";
 
 // ---------------------------------------------------------------------------
@@ -214,6 +215,7 @@ struct RawPipeline {
     flush_interval_ms: Option<u64>,
     backfill_chunk_size: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
+    maintenance_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -287,6 +289,8 @@ pub struct Pipeline {
     pub backfill_chunk_size: u64,
     /// How long graceful shutdown waits before the process aborts.
     pub shutdown_timeout_ms: u64,
+    /// How often the watchlist maintenance stage refreshes the leaderboard.
+    pub maintenance_interval_ms: u64,
 }
 
 /// Kafka/Redpanda transport settings (M5). Only consulted when
@@ -473,6 +477,12 @@ impl Config {
             raw.pipeline.shutdown_timeout_ms.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_MS);
         bound("pipeline.shutdown_timeout_ms", shutdown_timeout_ms, 100, 120_000)?;
 
+        let maintenance_interval_ms = raw
+            .pipeline
+            .maintenance_interval_ms
+            .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL_MS);
+        bound("pipeline.maintenance_interval_ms", maintenance_interval_ms, 1_000, 3_600_000)?;
+
         let backfill_chunk_size = raw.pipeline.backfill_chunk_size.unwrap_or(DEFAULT_BACKFILL_CHUNK);
         bound("pipeline.backfill_chunk_size", backfill_chunk_size, 1, 100_000)?;
 
@@ -574,6 +584,7 @@ impl Config {
                 flush_interval_ms,
                 backfill_chunk_size,
                 shutdown_timeout_ms,
+                maintenance_interval_ms,
             },
             kafka: Kafka {
                 brokers_csv: brokers.join(","),
