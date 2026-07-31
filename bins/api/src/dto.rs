@@ -26,6 +26,39 @@ pub struct PoolDto {
     pub is_indexed: bool,
 }
 
+/// A wallet's still-open position in one token.
+#[derive(Debug, Serialize)]
+pub struct OpenPositionDto {
+    pub token: String,
+    pub qty_held: String,
+    pub cost_basis_usd: String,
+}
+
+/// One realised drawdown in a wallet's history.
+#[derive(Debug, Serialize)]
+pub struct RealizedTradeDto {
+    pub sell_block: i64,
+    pub consume_seq: i32,
+    pub token: String,
+    pub qty_consumed: String,
+    pub proceeds_usd: String,
+    pub realized_pnl_usd: String,
+}
+
+/// A wallet's full PnL picture.
+#[derive(Debug, Serialize)]
+pub struct ScorecardDto {
+    pub wallet: String,
+    pub realized_pnl_usd: String,
+    pub trades: i32,
+    pub wins: i32,
+    pub volume_usd: String,
+    pub avg_size_usd: String,
+    pub excluded: bool,
+    pub open_positions: Vec<OpenPositionDto>,
+    pub recent_realized: Vec<RealizedTradeDto>,
+}
+
 /// One OHLCV candle.
 #[derive(Debug, Serialize)]
 pub struct CandleDto {

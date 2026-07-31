@@ -236,3 +236,123 @@ pub async fn candles_page(
     };
     Ok(Page { items, next_cursor })
 }
+
+// ---------------------------------------------------------------------------
+// Wallet scorecard and trade history (#88)
+// ---------------------------------------------------------------------------
+
+use crate::dto::{OpenPositionDto, RealizedTradeDto, ScorecardDto};
+
+fn realized_from_row(r: &sqlx::postgres::PgRow) -> RealizedTradeDto {
+    RealizedTradeDto {
+        sell_block: r.get("sell_block"),
+        consume_seq: r.get("consume_seq"),
+        token: hex0x(&r.get::<Vec<u8>, _>("token")),
+        qty_consumed: r.get("qty_consumed"),
+        proceeds_usd: r.get("proceeds_usd"),
+        realized_pnl_usd: r.get("realized_pnl_usd"),
+    }
+}
+
+/// One wallet's scorecard, or `None` when it has no stats row.
+pub async fn wallet_scorecard(
+    pool: &PgPool,
+    wallet: &[u8; 20],
+) -> Result<Option<ScorecardDto>, ApiError> {
+    let Some(s) = sqlx::query(
+        "SELECT realized_pnl_usd::text AS realized, trades, wins, \
+                volume_usd::text AS volume, avg_size_usd::text AS avg, excluded \
+           FROM wallet_stats WHERE wallet = $1",
+    )
+    .bind(wallet.as_slice())
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let open_positions = sqlx::query(
+        "SELECT token, qty_held::text AS qty, cost_basis_usd::text AS cost \
+           FROM wallet_positions WHERE wallet = $1 AND qty_held > 0 \
+          ORDER BY cost_basis_usd DESC",
+    )
+    .bind(wallet.as_slice())
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|r| OpenPositionDto {
+        token: hex0x(&r.get::<Vec<u8>, _>("token")),
+        qty_held: r.get("qty"),
+        cost_basis_usd: r.get("cost"),
+    })
+    .collect();
+
+    let recent_realized = sqlx::query(
+        "SELECT sell_block, consume_seq, token, qty_consumed::text AS qty_consumed, \
+                proceeds_usd::text AS proceeds_usd, realized_pnl_usd::text AS realized_pnl_usd \
+           FROM lot_consumptions WHERE wallet = $1 \
+          ORDER BY sell_block DESC, consume_seq DESC LIMIT 10",
+    )
+    .bind(wallet.as_slice())
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(realized_from_row)
+    .collect();
+
+    Ok(Some(ScorecardDto {
+        wallet: hex0x(wallet.as_slice()),
+        realized_pnl_usd: s.get("realized"),
+        trades: s.get("trades"),
+        wins: s.get("wins"),
+        volume_usd: s.get("volume"),
+        avg_size_usd: s.get("avg"),
+        excluded: s.get("excluded"),
+        open_positions,
+        recent_realized,
+    }))
+}
+
+/// A keyset page of a wallet's realised trades, newest-first.
+pub async fn wallet_trades_page(
+    pool: &PgPool,
+    wallet: &[u8; 20],
+    after: Option<Keyset>,
+    limit: i64,
+) -> Result<Page<RealizedTradeDto>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT sell_block, consume_seq, token, qty_consumed::text AS qty_consumed, \
+                proceeds_usd::text AS proceeds_usd, realized_pnl_usd::text AS realized_pnl_usd \
+           FROM lot_consumptions \
+          WHERE wallet = $1 \
+            AND ($2::bigint IS NULL \
+                 OR sell_block < $2 \
+                 OR (sell_block = $2 AND consume_seq < $3)) \
+          ORDER BY sell_block DESC, consume_seq DESC \
+          LIMIT $4",
+    )
+    .bind(wallet.as_slice())
+    .bind(after.map(|k| k.block_number))
+    .bind(after.map(|k| k.log_index))
+    .bind(limit + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let has_more = rows.len() as i64 > limit;
+    let items: Vec<RealizedTradeDto> = rows[..rows.len().min(limit as usize)]
+        .iter()
+        .map(realized_from_row)
+        .collect();
+    let next_cursor = if has_more {
+        items.last().map(|t| {
+            Keyset {
+                block_number: t.sell_block,
+                log_index: t.consume_seq,
+            }
+            .encode()
+        })
+    } else {
+        None
+    };
+    Ok(Page { items, next_cursor })
+}

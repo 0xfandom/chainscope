@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::dto::{CandleDto, Page, PoolDto, SwapDto};
+use crate::dto::{CandleDto, Page, PoolDto, RealizedTradeDto, ScorecardDto, SwapDto};
 use crate::error::ApiError;
 use crate::pagination::{clamp_limit, decode_bucket, decode_cursor};
 use crate::util::parse_address;
@@ -77,4 +77,28 @@ pub async fn pool_candles(
     Ok(Json(
         db::candles_page(&state.pool, &addr, resolution, before, limit).await?,
     ))
+}
+
+/// A wallet's PnL scorecard: rollup, open positions and a recent realised trail.
+pub async fn wallet_scorecard(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> Result<Json<ScorecardDto>, ApiError> {
+    let addr = parse_address(&address)?;
+    db::wallet_scorecard(&state.pool, &addr)
+        .await?
+        .map(Json)
+        .ok_or(ApiError::NotFound)
+}
+
+/// A wallet's realised trades, keyset-paginated, newest-first.
+pub async fn wallet_trades(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<Page<RealizedTradeDto>>, ApiError> {
+    let addr = parse_address(&address)?;
+    let after = decode_cursor(&params.cursor)?;
+    let limit = clamp_limit(params.limit);
+    Ok(Json(db::wallet_trades_page(&state.pool, &addr, after, limit).await?))
 }
