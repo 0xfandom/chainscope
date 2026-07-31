@@ -1,0 +1,17 @@
+# Prometheus scrape configuration for the chainscope stack.
+#
+# One job: the read API, which exposes the indexer's progress and disk
+# footprint as gauges at /metrics (rendered per scrape from chain_state and
+# pg_total_relation_size). 15s is frequent enough to watch ingest lag move
+# without hammering the query behind the endpoint.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: chainscope-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8080"]
+        labels:
+          service: chainscope-api
