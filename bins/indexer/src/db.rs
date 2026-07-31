@@ -1880,3 +1880,57 @@ pub async fn prune_raw_partitions(
     }
     Ok(dropped)
 }
+
+// ---------------------------------------------------------------------------
+// Disk-footprint metric (#115)
+// ---------------------------------------------------------------------------
+
+/// On-disk size of the chainscope tables, split into the transient raw events
+/// (which retention keeps flat) and the permanent aggregates (which persist).
+#[derive(Debug, Clone, Default)]
+pub struct Footprint {
+    /// Bytes in `swaps`/`liq_events` and their day partitions.
+    pub raw_bytes: i64,
+    /// Bytes in the candle, wallet and pool tables — the permanent record.
+    pub aggregate_bytes: i64,
+    /// Per-relation sizes, largest first, for a logged breakdown.
+    pub per_table: Vec<(String, i64)>,
+}
+
+/// Measure the footprint. `pg_total_relation_size` counts the table, its
+/// indexes and TOAST; the raw parents are partitioned, so their day children are
+/// summed in too.
+pub async fn footprint(pool: &PgPool) -> anyhow::Result<Footprint> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT c.relname, pg_total_relation_size(c.oid)
+           FROM pg_class c
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE n.nspname = 'public'
+            AND c.relkind IN ('r', 'p')
+            AND (c.relname IN ('swaps','liq_events','ohlcv_1m','ohlcv_1h','ohlcv_1d',
+                               'wallet_positions','wallet_stats','lot_consumptions',
+                               'pools','blocks','chain_state','alerts_sent')
+                 OR c.relname LIKE 'swaps\\_%' OR c.relname LIKE 'liq\\_events\\_%')
+          ORDER BY pg_total_relation_size(c.oid) DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .context("could not measure the disk footprint")?;
+
+    let is_raw = |name: &str| {
+        name == "swaps"
+            || name == "liq_events"
+            || name.starts_with("swaps_")
+            || name.starts_with("liq_events_")
+    };
+    let mut fp = Footprint::default();
+    for (name, bytes) in &rows {
+        if is_raw(name) {
+            fp.raw_bytes += bytes;
+        } else {
+            fp.aggregate_bytes += bytes;
+        }
+    }
+    fp.per_table = rows;
+    Ok(fp)
+}
