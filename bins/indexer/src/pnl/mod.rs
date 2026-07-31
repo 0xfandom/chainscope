@@ -30,9 +30,59 @@
 //! leg is valued from it; a swap between two unpriceable tokens (rare in the top
 //! pools) is returned as `Unpriceable` — counted by the engine, not valued.
 
+pub mod fifo;
+
+use std::collections::HashSet;
+
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::BigDecimal;
 use chainscope_core::types::{Address20, SwapRow};
+
+/// Which tokens we can value in USD, and how.
+///
+/// This is the "our own indexed prices, no external feed" boundary. Stablecoins
+/// are taken at $1. WETH is priced from the latest close of a designated
+/// WETH/stable pool's candle — a number the indexer itself produced. Any token
+/// not named here is unpriceable, so a swap between two such tokens is counted
+/// but carries no USD basis.
+///
+/// The set is data, injected from config, not baked into the classifier — so the
+/// numeraire policy stays in one place and the maths stays pure.
+#[derive(Debug, Clone, Default)]
+pub struct Numeraire {
+    pub stables: HashSet<Address20>,
+    pub weth: Option<Address20>,
+    /// The pool whose latest 1m candle close gives WETH in USD. Resolved at write
+    /// time from our own `ohlcv_1m`.
+    pub weth_price_pool: Option<Address20>,
+}
+
+impl Numeraire {
+    /// A numeraire that prices nothing — the PnL fold is skipped entirely.
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// Whether any token can be priced. When false the writer takes a fast path
+    /// and folds no PnL, so the existing non-PnL call sites pay nothing.
+    pub fn is_active(&self) -> bool {
+        !self.stables.is_empty() || self.weth.is_some()
+    }
+
+    /// The price lookup the classifier needs, given the WETH/USD reference the
+    /// writer resolved from a candle (`None` if unavailable this write).
+    pub fn pricer(&self, weth_usd: Option<BigDecimal>) -> impl Fn(&Address20) -> Option<BigDecimal> + '_ {
+        move |t| {
+            if self.stables.contains(t) {
+                Some(BigDecimal::from(1))
+            } else if self.weth.as_ref() == Some(t) {
+                weth_usd.clone()
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// Static token metadata for the pool a swap happened in. Supplied by the engine
 /// from the `pools` row; the classifier never touches the database.
