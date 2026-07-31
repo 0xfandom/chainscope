@@ -117,12 +117,21 @@ impl Writer {
 
     /// Undo this consumer's state above `from_block` in response to a revert.
     ///
-    /// The real undo — `DELETE ... WHERE block_number > from_block` plus the
-    /// candle recompute-from-survivors, in one idempotent transaction (M4's
-    /// `rewind_to`) — lands in #60. For now the writer recognises the revert and
-    /// advances past it so the stream keeps flowing; nothing is deleted yet.
+    /// This *is* M4's `rewind_to`, now driven by an event instead of a producer
+    /// hook: one transaction that deletes every header/swap/liq above the fork
+    /// and recomputes the candles those swaps touched from the swaps that survive
+    /// (#47). With no central rewind under the log, each consumer undoes only the
+    /// state it built, and because every consumer reads the same total order
+    /// (orphans → revert → canonical) they all converge without coordination.
+    ///
+    /// It is idempotent, which it must be — the log is at-least-once, so a revert
+    /// can be redelivered. `DELETE ... WHERE block_number > from_block` is a no-op
+    /// on an already-empty range, the candle recompute is a pure function of the
+    /// surviving rows, and the cursor is *set* to `from_block` (not moved by
+    /// `GREATEST`), so replaying the same revert changes nothing.
     async fn apply_revert(&mut self, from_block: u64) -> anyhow::Result<()> {
-        tracing::warn!(from_block, "revert received; consumer-side undo lands in #60");
+        let removed = crate::db::rewind_to(&self.pool, from_block, false).await?;
+        tracing::warn!(from_block, removed, "revert applied; undid state above the fork");
         Ok(())
     }
 
