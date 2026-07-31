@@ -6,7 +6,7 @@
 //! `_sqlx_migrations` table and applies only what is missing — running twice
 //! against the same database is a no-op.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::str::FromStr;
 
@@ -309,6 +309,11 @@ pub async fn rewind_to(
             .await
             .context("could not recompute the affected candles")?;
     }
+
+    // Undo the PnL the orphaned swaps produced, exactly, from the ledger. A no-op
+    // when nothing was folded (PnL off), so the channel/kafka reorg paths that
+    // run without a numeraire pay nothing here.
+    reverse_pnl(&mut tx, f).await?;
 
     sqlx::query(
         "UPDATE chain_state SET live_cursor = $1, updated_at = now() WHERE id = 1",
@@ -1155,6 +1160,214 @@ async fn bump_wallet_stats(
     .execute(&mut **tx)
     .await
     .context("could not update wallet stats")?;
+    Ok(())
+}
+
+/// Merge lot fragments that belong to the same original lot — same acquisition
+/// block and unit cost — back into one, then order the queue FIFO (block asc).
+///
+/// A reorg restores a lot piecemeal (one fragment per drawdown that touched it),
+/// so a lot originally acquired as a single buy comes back as several fragments;
+/// coalescing rebuilds the single lot the canonical chain would have.
+fn coalesce_lots(lots: Vec<Lot>) -> Vec<Lot> {
+    let mut acc: Vec<(u64, String, BigDecimal, BigDecimal)> = Vec::new();
+    for l in lots {
+        let key = l.price_usd.normalized().to_string();
+        if let Some(e) = acc.iter_mut().find(|e| e.0 == l.block && e.1 == key) {
+            e.2 += &l.qty;
+        } else {
+            acc.push((l.block, key, l.qty, l.price_usd));
+        }
+    }
+    acc.sort_by_key(|e| e.0);
+    acc.into_iter()
+        .map(|(block, _, qty, price_usd)| Lot {
+            qty,
+            price_usd,
+            block,
+        })
+        .collect()
+}
+
+/// Undo, exactly, the PnL every swap above `fork` produced (#73).
+///
+/// Realised PnL is a sum of recorded contributions, so a reorg *reverses* rather
+/// than recomputes (which FIFO could not do from the pruned survivors): restore
+/// what each above-fork sell consumed, drop what each above-fork buy opened, and
+/// back the totals out of `wallet_stats`. Runs inside the rewind transaction, so
+/// it commits atomically with the swap/candle deletes and the cursor reset.
+///
+/// Idempotent: a redelivered revert (Kafka is at-least-once) finds nothing above
+/// the fork and changes nothing. A no-op when PnL was never folded.
+async fn reverse_pnl(tx: &mut sqlx::Transaction<'_, Postgres>, fork: i64) -> anyhow::Result<()> {
+    #[derive(Default)]
+    struct Delta {
+        realized: BigDecimal,
+        volume: BigDecimal,
+        trades: i64,
+        wins: i64,
+    }
+    let mut deltas: HashMap<Address20, Delta> = HashMap::new();
+    let mut restore: HashMap<(Address20, Address20), Vec<Lot>> = HashMap::new();
+    // Aggregate the ledger per sell so each sell counts as one trade, one win.
+    let mut sells: HashMap<(Vec<u8>, i32), (Address20, BigDecimal, BigDecimal)> = HashMap::new();
+
+    // --- A) sells above the fork: gather restorations and per-sell totals ---
+    let rows = sqlx::query(
+        "SELECT wallet, token, sell_tx, sell_log, qty_consumed, lot_unit_cost_usd,
+                lot_acquired_block, proceeds_usd, realized_pnl_usd
+           FROM lot_consumptions WHERE sell_block > $1",
+    )
+    .bind(fork)
+    .fetch_all(&mut **tx)
+    .await
+    .context("could not read the consumption ledger for reversal")?;
+
+    for r in &rows {
+        let wallet: Vec<u8> = r.get("wallet");
+        let token: Vec<u8> = r.get("token");
+        let wa: Address20 = wallet.try_into().unwrap_or([0; 20]);
+        let ta: Address20 = token.try_into().unwrap_or([0; 20]);
+        let sell_tx: Vec<u8> = r.get("sell_tx");
+        let sell_log: i32 = r.get("sell_log");
+        let qty: BigDecimal = r.get("qty_consumed");
+        let unit: BigDecimal = r.get("lot_unit_cost_usd");
+        let lot_block: i64 = r.get("lot_acquired_block");
+        let proceeds: BigDecimal = r.get("proceeds_usd");
+        let realized: BigDecimal = r.get("realized_pnl_usd");
+
+        restore.entry((wa, ta)).or_default().push(Lot {
+            qty,
+            price_usd: unit,
+            block: lot_block as u64,
+        });
+        let e = sells
+            .entry((sell_tx, sell_log))
+            .or_insert_with(|| (wa, BigDecimal::from(0), BigDecimal::from(0)));
+        e.1 += realized;
+        e.2 += proceeds;
+    }
+    for (_, (wa, realized, proceeds)) in sells {
+        let d = deltas.entry(wa).or_default();
+        d.realized += &realized;
+        d.volume += &proceeds;
+        d.trades += 1;
+        if realized.sign() == Sign::Plus {
+            d.wins += 1;
+        }
+    }
+    sqlx::query("DELETE FROM lot_consumptions WHERE sell_block > $1")
+        .bind(fork)
+        .execute(&mut **tx)
+        .await
+        .context("could not delete reversed consumptions")?;
+
+    // --- B) touched positions: restored ones, plus any still holding a buy > fork ---
+    let bpos = sqlx::query(
+        "SELECT wallet, token FROM wallet_positions
+          WHERE jsonb_path_exists(lots, '$[*] ? (@.block > $f)',
+                                  jsonb_build_object('f', $1::bigint))",
+    )
+    .bind(fork)
+    .fetch_all(&mut **tx)
+    .await
+    .context("could not find positions with orphaned lots")?;
+
+    let mut touched: HashSet<(Address20, Address20)> = restore.keys().copied().collect();
+    for r in &bpos {
+        let wallet: Vec<u8> = r.get("wallet");
+        let token: Vec<u8> = r.get("token");
+        touched.insert((
+            wallet.try_into().unwrap_or([0; 20]),
+            token.try_into().unwrap_or([0; 20]),
+        ));
+    }
+
+    for (wa, ta) in touched {
+        let mut pos = load_position(tx, &wa, &ta).await?;
+        if let Some(mut frags) = restore.remove(&(wa, ta)) {
+            pos.lots.append(&mut frags);
+        }
+        pos.lots = coalesce_lots(pos.lots);
+
+        // Every lot left above the fork is a buy to back out.
+        let mut kept = Vec::new();
+        for l in pos.lots.drain(..) {
+            if l.block as i64 > fork {
+                let d = deltas.entry(wa).or_default();
+                d.volume += &l.qty * &l.price_usd;
+                d.trades += 1;
+            } else {
+                kept.push(l);
+            }
+        }
+        pos.lots = kept;
+
+        if pos.lots.is_empty() {
+            sqlx::query("DELETE FROM wallet_positions WHERE wallet = $1 AND token = $2")
+                .bind(wa.as_slice())
+                .bind(ta.as_slice())
+                .execute(&mut **tx)
+                .await
+                .context("could not drop an emptied position")?;
+        } else {
+            save_position(tx, &wa, &ta, &pos, fork as u64).await?;
+        }
+    }
+
+    // --- C) subtract the deltas; drop a wallet whose trades fall to zero ---
+    for (wa, d) in deltas {
+        let Some(row) = sqlx::query("SELECT trades FROM wallet_stats WHERE wallet = $1")
+            .bind(wa.as_slice())
+            .fetch_optional(&mut **tx)
+            .await
+            .context("could not read wallet stats for reversal")?
+        else {
+            continue;
+        };
+        let trades: i32 = row.get("trades");
+        if trades - d.trades as i32 <= 0 {
+            sqlx::query("DELETE FROM wallet_stats WHERE wallet = $1")
+                .bind(wa.as_slice())
+                .execute(&mut **tx)
+                .await
+                .context("could not drop an emptied wallet")?;
+            continue;
+        }
+        // Last activity is a max over the survivors — recomputable, unlike the sums.
+        let last_active: Option<i64> = sqlx::query_scalar(
+            "SELECT GREATEST(
+                (SELECT max((l->>'block')::bigint)
+                   FROM wallet_positions wp, jsonb_array_elements(wp.lots) l
+                  WHERE wp.wallet = $1),
+                (SELECT max(sell_block) FROM lot_consumptions WHERE wallet = $1))",
+        )
+        .bind(wa.as_slice())
+        .fetch_one(&mut **tx)
+        .await
+        .context("could not recompute last-active block")?;
+
+        sqlx::query(
+            "UPDATE wallet_stats SET
+                realized_pnl_usd  = realized_pnl_usd - $2,
+                volume_usd        = volume_usd - $3,
+                trades            = trades - $4,
+                wins              = wins - $5,
+                avg_size_usd      = (volume_usd - $3) / (trades - $4),
+                last_active_block = $6
+             WHERE wallet = $1",
+        )
+        .bind(wa.as_slice())
+        .bind(d.realized)
+        .bind(d.volume)
+        .bind(d.trades as i32)
+        .bind(d.wins as i32)
+        .bind(last_active)
+        .execute(&mut **tx)
+        .await
+        .context("could not back stats out")?;
+    }
+
     Ok(())
 }
 
