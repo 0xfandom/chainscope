@@ -1,7 +1,10 @@
 //! HTTP handlers.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
@@ -17,9 +20,23 @@ pub async fn healthz(State(state): State<AppState>) -> Result<StatusCode, ApiErr
     Ok(StatusCode::OK)
 }
 
-/// Ingestion progress: head, finalized, cursors and the lag to head.
-pub async fn status(State(state): State<AppState>) -> Result<Json<db::Status>, ApiError> {
-    Ok(Json(db::status(&state.pool).await?))
+/// Render cached JSON bytes as an `application/json` response.
+fn json_response(body: Arc<Vec<u8>>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], (*body).clone()).into_response()
+}
+
+/// Ingestion progress: head, finalized, cursors and the lag to head. Cached — it
+/// is small, shared, and polled far more often than it changes.
+pub async fn status(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let pool = state.pool.clone();
+    let body = state
+        .cache
+        .get_or_compute("status", || async move {
+            let s = db::status(&pool).await?;
+            serde_json::to_vec(&s).map_err(|e| ApiError::Internal(e.into()))
+        })
+        .await?;
+    Ok(json_response(body))
 }
 
 /// The indexed pools.
@@ -113,9 +130,17 @@ pub struct LimitParams {
 pub async fn leaderboard(
     State(state): State<AppState>,
     Query(params): Query<LimitParams>,
-) -> Result<Json<Vec<crate::dto::LeaderRowDto>>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = clamp_limit(params.limit);
-    Ok(Json(db::leaderboard(&state.pool, limit).await?))
+    let pool = state.pool.clone();
+    let body = state
+        .cache
+        .get_or_compute(&format!("leaderboard:{limit}"), || async move {
+            let rows = db::leaderboard(&pool, limit).await?;
+            serde_json::to_vec(&rows).map_err(|e| ApiError::Internal(e.into()))
+        })
+        .await?;
+    Ok(json_response(body))
 }
 
 /// Recently discovered pools, keyset-paginated on discovery time.

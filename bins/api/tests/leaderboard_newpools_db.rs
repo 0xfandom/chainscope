@@ -55,7 +55,7 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
 async fn leaderboard_is_ranked_and_wash_excluded() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin, "lb").await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
 
     // Before any refresh the matview is unpopulated -> the endpoint returns [].
     let (st, empty) = get(&state, "/leaderboard").await;
@@ -91,7 +91,7 @@ async fn leaderboard_is_ranked_and_wash_excluded() {
 async fn new_pools_newest_first() {
     let Some(admin) = admin().await else { return };
     let (pool, name) = fresh_db(&admin, "np").await;
-    let state = AppState { pool: pool.clone() };
+    let state = AppState::new(pool.clone(), std::time::Duration::ZERO);
 
     for (addr, when) in [(P1, 1_784_800_000i64), (P2, 1_784_900_000)] {
         sqlx::query(

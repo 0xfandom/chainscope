@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(bind = %cfg.bind, max_conns = cfg.max_connections, "configuration loaded");
 
     let pool = db::connect(&cfg.database_url, cfg.max_connections).await?;
-    let state = AppState { pool };
+    let state = AppState::new(pool, cfg.cache_ttl);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %cfg.bind, "chainscope-api listening");
