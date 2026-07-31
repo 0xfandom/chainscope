@@ -432,6 +432,43 @@ ON CONFLICT (pool, bucket) DO UPDATE SET
     volume1     = ohlcv_1m.volume1 + EXCLUDED.volume1,
     trade_count = ohlcv_1m.trade_count + EXCLUDED.trade_count";
 
+// The live path's 1m candle fold (#111). Same price math and conflict rules as
+// CANDLE_MOVE, but fed by arrays of the swaps just inserted (unnest) rather than
+// a staging table — the live writer inserts per row, not by COPY. `open` is left
+// untouched on conflict: live blocks arrive in order, so a bucket's earliest
+// swap is seen first and the stored open is already true.
+const CANDLE_LIVE: &str = "
+WITH priced AS (
+    SELECT pool,
+           date_trunc('minute', to_timestamp(bt)) AS bucket,
+           bn, li,
+           (sp * sp) / power(2::numeric, 192) AS price,
+           abs(a0) AS v0, abs(a1) AS v1
+    FROM unnest($1::bytea[], $2::bigint[], $3::bigint[], $4::int[],
+                $5::numeric[], $6::numeric[], $7::numeric[])
+         AS t(pool, bt, bn, li, sp, a0, a1)
+),
+agg AS (
+    SELECT pool, bucket,
+           (array_agg(price ORDER BY bn, li))[1]           AS open,
+           (array_agg(price ORDER BY bn DESC, li DESC))[1] AS close,
+           max(price) AS high,
+           min(price) AS low,
+           sum(v0)    AS volume0,
+           sum(v1)    AS volume1,
+           count(*)   AS trade_count
+    FROM priced GROUP BY pool, bucket
+)
+INSERT INTO ohlcv_1m (pool, bucket, open, high, low, close, volume0, volume1, trade_count)
+SELECT pool, bucket, open, high, low, close, volume0, volume1, trade_count FROM agg
+ON CONFLICT (pool, bucket) DO UPDATE SET
+    high        = GREATEST(ohlcv_1m.high, EXCLUDED.high),
+    low         = LEAST(ohlcv_1m.low, EXCLUDED.low),
+    close       = EXCLUDED.close,
+    volume0     = ohlcv_1m.volume0 + EXCLUDED.volume0,
+    volume1     = ohlcv_1m.volume1 + EXCLUDED.volume1,
+    trade_count = ohlcv_1m.trade_count + EXCLUDED.trade_count";
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -740,17 +777,53 @@ pub async fn write_row_batches_with_pnl(
     let price = numeraire.pricer(weth_usd);
     let mut pool_meta: HashMap<Address20, Option<PoolMeta>> = HashMap::new();
 
+    // Candle inputs for the swaps newly inserted this tx. Folding from the
+    // inserted set (not the incoming batch) keeps replay a zero delta, exactly
+    // as the bulk path does.
+    let mut c_pool: Vec<Vec<u8>> = Vec::new();
+    let mut c_bt: Vec<i64> = Vec::new();
+    let mut c_bn: Vec<i64> = Vec::new();
+    let mut c_li: Vec<i32> = Vec::new();
+    let mut c_sp: Vec<BigDecimal> = Vec::new();
+    let mut c_a0: Vec<BigDecimal> = Vec::new();
+    let mut c_a1: Vec<BigDecimal> = Vec::new();
+
     for b in batches {
         insert_block(&mut tx, b).await?;
         for s in &b.swaps {
             let inserted = insert_swap(&mut tx, b, s).await?;
-            if inserted && active {
-                fold_swap_pnl(&mut tx, b.block_number, s, &price, &mut pool_meta).await?;
+            if inserted {
+                c_pool.push(s.pool.to_vec());
+                c_bt.push(b.block_time);
+                c_bn.push(b.block_number as i64);
+                c_li.push(s.log_index as i32);
+                c_sp.push(s.sqrt_price_x96.clone());
+                c_a0.push(s.amount0.clone());
+                c_a1.push(s.amount1.clone());
+                if active {
+                    fold_swap_pnl(&mut tx, b.block_number, s, &price, &mut pool_meta).await?;
+                }
             }
         }
         for l in &b.liq_events {
             insert_liq(&mut tx, b, l).await?;
         }
+    }
+
+    // Fold the 1m candles for the newly-inserted swaps — the live path's
+    // equivalent of the bulk candle fold, so live prices survive raw pruning.
+    if !c_pool.is_empty() {
+        sqlx::query(CANDLE_LIVE)
+            .bind(&c_pool)
+            .bind(&c_bt)
+            .bind(&c_bn)
+            .bind(&c_li)
+            .bind(&c_sp)
+            .bind(&c_a0)
+            .bind(&c_a1)
+            .execute(&mut *tx)
+            .await
+            .context("could not fold live candles")?;
     }
 
     // The producer is sequential and in order, so the last block is the highest.
