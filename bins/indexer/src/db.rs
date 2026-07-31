@@ -6,13 +6,21 @@
 //! `_sqlx_migrations` table and applies only what is missing — running twice
 //! against the same database is a no-op.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::str::FromStr;
 
 use anyhow::Context;
+use bigdecimal::num_bigint::Sign;
+use bigdecimal::BigDecimal;
 use sqlx::postgres::{PgPool, PgPoolOptions};
-use sqlx::Postgres;
+use sqlx::types::Json;
+use sqlx::{Postgres, Row};
 
 use crate::config::Database;
+use crate::pnl::fifo::{Lot, Position, SellOutcome};
+use crate::pnl::{classify, Classified, Numeraire, PoolMeta};
+use chainscope_core::types::Address20;
 use chainscope_core::{LiqRow, RowBatch, SwapRow};
 
 /// Migrations live at the workspace root, not inside this crate, because the
@@ -691,16 +699,49 @@ pub async fn write_row_batches(
     batches: &[RowBatch],
     fail_before_commit: bool,
 ) -> anyhow::Result<u64> {
+    write_row_batches_with_pnl(pool, batches, fail_before_commit, &Numeraire::disabled()).await
+}
+
+/// Like [`write_row_batches`], but also folds FIFO cost-basis PnL for every swap
+/// that is *newly inserted this transaction* — into `wallet_positions`,
+/// `wallet_stats` and the `lot_consumptions` ledger — inside the one commit that
+/// carries the rows and the cursor.
+///
+/// A replayed batch inserts no swaps (the `ON CONFLICT` gate), so it folds no
+/// PnL: exactly-once for derived state is inherited from the same RETURNING
+/// discipline that already protects the candles, never re-earned. When the
+/// numeraire prices nothing the fold is skipped entirely, so the plain
+/// `write_row_batches` path pays nothing.
+pub async fn write_row_batches_with_pnl(
+    pool: &PgPool,
+    batches: &[RowBatch],
+    fail_before_commit: bool,
+    numeraire: &Numeraire,
+) -> anyhow::Result<u64> {
     if batches.is_empty() {
         return Ok(0);
     }
 
     let mut tx = pool.begin().await.context("could not open write transaction")?;
 
+    // Resolve the WETH/USD reference once for the batch — blocks are small, and
+    // a single candle read keeps the fold from querying per swap.
+    let active = numeraire.is_active();
+    let weth_usd = if active {
+        resolve_weth_usd(&mut tx, numeraire).await?
+    } else {
+        None
+    };
+    let price = numeraire.pricer(weth_usd);
+    let mut pool_meta: HashMap<Address20, Option<PoolMeta>> = HashMap::new();
+
     for b in batches {
         insert_block(&mut tx, b).await?;
         for s in &b.swaps {
-            insert_swap(&mut tx, b, s).await?;
+            let inserted = insert_swap(&mut tx, b, s).await?;
+            if inserted && active {
+                fold_swap_pnl(&mut tx, b.block_number, s, &price, &mut pool_meta).await?;
+            }
         }
         for l in &b.liq_events {
             insert_liq(&mut tx, b, l).await?;
@@ -755,20 +796,25 @@ async fn insert_block(
     Ok(())
 }
 
+/// Insert one swap, returning whether it was *newly* inserted. A conflict (the
+/// row already exists, i.e. a replay) returns `None` from `RETURNING`, so the
+/// caller knows not to fold its PnL a second time — the gate that makes the
+/// derived state exactly-once.
 async fn insert_swap(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     b: &RowBatch,
     s: &SwapRow,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // block_time and block_number come from the block, not the row: block_time
     // is the partition key, and it must match the value the block header used so
     // the conflict on `(block_time, tx_hash, log_index)` fires on replay.
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO swaps
             (block_time, tx_hash, log_index, block_number, pool, sender, recipient,
              amount0, amount1, sqrt_price_x96, liquidity, tick)
          VALUES (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING",
+         ON CONFLICT (block_time, tx_hash, log_index) DO NOTHING
+         RETURNING 1 AS inserted",
     )
     .bind(b.block_time)
     .bind(s.tx_hash.as_slice())
@@ -782,10 +828,10 @@ async fn insert_swap(
     .bind(s.sqrt_price_x96.clone())
     .bind(s.liquidity.clone())
     .bind(s.tick)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
     .with_context(|| format!("could not insert swap at block {}", b.block_number))?;
-    Ok(())
+    Ok(inserted.is_some())
 }
 
 async fn insert_liq(
@@ -815,6 +861,300 @@ async fn insert_liq(
     .execute(&mut **tx)
     .await
     .with_context(|| format!("could not insert liq_event at block {}", b.block_number))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FIFO cost-basis PnL fold (#72)
+//
+// Everything below runs inside the writer transaction, gated on a swap being
+// newly inserted, so it commits atomically with the rows and the cursor and a
+// replay contributes nothing.
+// ---------------------------------------------------------------------------
+
+/// The JSONB shape of one `wallet_positions.lots` entry. Amounts are decimal
+/// strings — NUMERIC precision through JSON without going via float.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LotJson {
+    qty: String,
+    price_usd: String,
+    block: i64,
+}
+
+impl LotJson {
+    fn from_lot(l: &Lot) -> Self {
+        Self {
+            qty: l.qty.to_string(),
+            price_usd: l.price_usd.to_string(),
+            block: l.block as i64,
+        }
+    }
+    fn into_lot(self) -> Lot {
+        Lot {
+            qty: BigDecimal::from_str(&self.qty).unwrap_or_else(|_| BigDecimal::from(0)),
+            price_usd: BigDecimal::from_str(&self.price_usd).unwrap_or_else(|_| BigDecimal::from(0)),
+            block: self.block as u64,
+        }
+    }
+}
+
+/// The current WETH/USD reference from our own candles, or `None` when the
+/// numeraire has no WETH pool or that pool has no candle yet. `ohlcv_1m.close`
+/// for a WETH/stable pool is USD-per-WETH by construction.
+async fn resolve_weth_usd(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    numeraire: &Numeraire,
+) -> anyhow::Result<Option<BigDecimal>> {
+    let Some(pool) = numeraire.weth_price_pool else {
+        return Ok(None);
+    };
+    let close: Option<BigDecimal> =
+        sqlx::query_scalar("SELECT close FROM ohlcv_1m WHERE pool = $1 ORDER BY bucket DESC LIMIT 1")
+            .bind(pool.as_slice())
+            .fetch_optional(&mut **tx)
+            .await
+            .context("could not read the WETH reference price")?;
+    Ok(close)
+}
+
+/// Pool token metadata, cached per transaction. `None` means the pool is unknown
+/// or has no decimals recorded, so its swaps cannot be classified and are left
+/// out of PnL (counted as raw rows only).
+async fn pool_meta_cached(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    pool: Address20,
+    cache: &mut HashMap<Address20, Option<PoolMeta>>,
+) -> anyhow::Result<Option<PoolMeta>> {
+    if let Some(hit) = cache.get(&pool) {
+        return Ok(hit.clone());
+    }
+    let row = sqlx::query(
+        "SELECT token0, token1, token0_decimals, token1_decimals FROM pools WHERE address = $1",
+    )
+    .bind(pool.as_slice())
+    .fetch_optional(&mut **tx)
+    .await
+    .context("could not read pool metadata")?;
+
+    let meta = row.and_then(|r| {
+        let token0: Vec<u8> = r.get("token0");
+        let token1: Vec<u8> = r.get("token1");
+        let d0: Option<i16> = r.get("token0_decimals");
+        let d1: Option<i16> = r.get("token1_decimals");
+        match (
+            token0.try_into().ok(),
+            token1.try_into().ok(),
+            d0,
+            d1,
+        ) {
+            (Some(t0), Some(t1), Some(d0), Some(d1)) if d0 >= 0 && d1 >= 0 => Some(PoolMeta {
+                token0: t0,
+                token1: t1,
+                token0_decimals: d0 as u8,
+                token1_decimals: d1 as u8,
+            }),
+            _ => None,
+        }
+    });
+    cache.insert(pool, meta.clone());
+    Ok(meta)
+}
+
+/// Fold one newly-inserted swap into PnL: open a lot in the bought token, consume
+/// lots of the sold token, record the drawdowns, and bump the wallet's stats.
+async fn fold_swap_pnl<F>(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    block_number: u64,
+    s: &SwapRow,
+    price: &F,
+    cache: &mut HashMap<Address20, Option<PoolMeta>>,
+) -> anyhow::Result<()>
+where
+    F: Fn(&Address20) -> Option<BigDecimal>,
+{
+    let Some(meta) = pool_meta_cached(tx, s.pool, cache).await? else {
+        return Ok(());
+    };
+    let trade = match classify(s, &meta, price) {
+        Classified::Priced(t) => t,
+        Classified::Unpriceable { .. } => return Ok(()),
+    };
+
+    // Only the non-numeraire (asset) leg is a tracked position — the numeraire
+    // leg is money, the yardstick, not something a wallet holds a cost basis in.
+    // Buying the asset opens a lot; selling it realises against the lots. A
+    // money-for-money swap (both legs priced) has no asset to track, and a swap
+    // with a priced leg always has exactly one unpriced one.
+    let bought_is_money = price(&trade.bought).is_some();
+    let sold_is_money = price(&trade.sold).is_some();
+
+    match (bought_is_money, sold_is_money) {
+        // Bought the asset, paid money: open a lot at the trade's per-unit cost.
+        (false, true) => {
+            if trade.bought_qty.sign() != Sign::Plus {
+                return Ok(());
+            }
+            let unit_cost = trade.value_usd.clone() / trade.bought_qty.clone();
+            let mut pos = load_position(tx, &trade.wallet, &trade.bought).await?;
+            pos.buy(trade.bought_qty.clone(), unit_cost, block_number);
+            save_position(tx, &trade.wallet, &trade.bought, &pos, block_number).await?;
+            // A buy realises nothing, but it is still a trade the wallet made.
+            bump_wallet_stats(
+                tx,
+                &trade.wallet,
+                &BigDecimal::from(0),
+                &trade.value_usd,
+                block_number,
+            )
+            .await?;
+        }
+        // Sold the asset, received money: consume lots FIFO and realise.
+        (true, false) => {
+            if trade.sold_qty.sign() != Sign::Plus {
+                return Ok(());
+            }
+            let mut pos = load_position(tx, &trade.wallet, &trade.sold).await?;
+            let outcome = pos.sell(&trade.sold_qty, &trade.value_usd, block_number);
+            save_position(tx, &trade.wallet, &trade.sold, &pos, block_number).await?;
+            insert_consumptions(tx, s, &trade.sold, block_number, &outcome).await?;
+            bump_wallet_stats(
+                tx,
+                &trade.wallet,
+                &outcome.realized_pnl_usd,
+                &trade.value_usd,
+                block_number,
+            )
+            .await?;
+        }
+        // Money-for-money, or (unreachable) two unpriced legs: no asset position.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Read a wallet's open lots for one token; an absent row is an empty position.
+async fn load_position(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    wallet: &Address20,
+    token: &Address20,
+) -> anyhow::Result<Position> {
+    let row = sqlx::query("SELECT lots FROM wallet_positions WHERE wallet = $1 AND token = $2")
+        .bind(wallet.as_slice())
+        .bind(token.as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .context("could not load wallet position")?;
+    let lots = match row {
+        Some(r) => {
+            let Json(js): Json<Vec<LotJson>> = r.get("lots");
+            js.into_iter().map(LotJson::into_lot).collect()
+        }
+        None => Vec::new(),
+    };
+    Ok(Position { lots })
+}
+
+/// Write a position back. `qty_held`/`cost_basis_usd` are recomputed from the
+/// lots so the summary columns can never drift from the queue they summarise.
+async fn save_position(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    wallet: &Address20,
+    token: &Address20,
+    pos: &Position,
+    block: u64,
+) -> anyhow::Result<()> {
+    let lots: Vec<LotJson> = pos.lots.iter().map(LotJson::from_lot).collect();
+    sqlx::query(
+        "INSERT INTO wallet_positions
+            (wallet, token, qty_held, cost_basis_usd, lots, updated_block)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (wallet, token) DO UPDATE SET
+            qty_held       = EXCLUDED.qty_held,
+            cost_basis_usd = EXCLUDED.cost_basis_usd,
+            lots           = EXCLUDED.lots,
+            updated_block  = EXCLUDED.updated_block",
+    )
+    .bind(wallet.as_slice())
+    .bind(token.as_slice())
+    .bind(pos.qty_held())
+    .bind(pos.cost_basis_usd())
+    .bind(Json(lots))
+    .bind(block as i64)
+    .execute(&mut **tx)
+    .await
+    .context("could not save wallet position")?;
+    Ok(())
+}
+
+/// Append the sell's drawdowns to the ledger. Keyed on `(sell_tx, sell_log,
+/// consume_seq)`, so a replay of the sell writes nothing.
+async fn insert_consumptions(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    s: &SwapRow,
+    token: &Address20,
+    block: u64,
+    outcome: &SellOutcome,
+) -> anyhow::Result<()> {
+    for (seq, c) in outcome.consumptions.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO lot_consumptions
+                (sell_tx, sell_log, consume_seq, wallet, token, qty_consumed,
+                 lot_unit_cost_usd, lot_acquired_block, proceeds_usd,
+                 realized_pnl_usd, sell_block)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (sell_tx, sell_log, consume_seq) DO NOTHING",
+        )
+        .bind(s.tx_hash.as_slice())
+        .bind(s.log_index as i32)
+        .bind(seq as i32)
+        .bind(s.recipient.as_slice())
+        .bind(token.as_slice())
+        .bind(c.qty_consumed.clone())
+        .bind(c.lot_unit_cost_usd.clone())
+        .bind(c.lot_block as i64)
+        .bind(c.proceeds_usd.clone())
+        .bind(c.realized_pnl_usd.clone())
+        .bind(block as i64)
+        .execute(&mut **tx)
+        .await
+        .context("could not record lot consumption")?;
+    }
+    Ok(())
+}
+
+/// Accumulate one swap into the wallet's rollup. Additive on conflict, which is
+/// safe precisely because the fold only runs for a newly-inserted swap — a
+/// replay never reaches here.
+async fn bump_wallet_stats(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    wallet: &Address20,
+    realized: &BigDecimal,
+    value_usd: &BigDecimal,
+    block: u64,
+) -> anyhow::Result<()> {
+    let win: i32 = if realized.sign() == Sign::Plus { 1 } else { 0 };
+    sqlx::query(
+        "INSERT INTO wallet_stats
+            (wallet, realized_pnl_usd, trades, wins, volume_usd, avg_size_usd, last_active_block)
+         VALUES ($1, $2, 1, $3, $4, $4, $5)
+         ON CONFLICT (wallet) DO UPDATE SET
+            realized_pnl_usd  = wallet_stats.realized_pnl_usd + EXCLUDED.realized_pnl_usd,
+            trades            = wallet_stats.trades + 1,
+            wins              = wallet_stats.wins + EXCLUDED.wins,
+            volume_usd        = wallet_stats.volume_usd + EXCLUDED.volume_usd,
+            avg_size_usd      = (wallet_stats.volume_usd + EXCLUDED.volume_usd)
+                                / (wallet_stats.trades + 1),
+            last_active_block = GREATEST(COALESCE(wallet_stats.last_active_block, -1),
+                                         EXCLUDED.last_active_block)",
+    )
+    .bind(wallet.as_slice())
+    .bind(realized.clone())
+    .bind(win)
+    .bind(value_usd.clone())
+    .bind(block as i64)
+    .execute(&mut **tx)
+    .await
+    .context("could not update wallet stats")?;
     Ok(())
 }
 

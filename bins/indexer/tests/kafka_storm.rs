@@ -228,7 +228,7 @@ fn spawn_consumers(
         group_id: wr_group,
     })
     .expect("rows source");
-    let writer = Writer::new(pool.clone(), rows_source, 8, Duration::from_millis(5));
+    let writer = Writer::new(pool.clone(), rows_source, 8, Duration::from_millis(5), chainscope_indexer::pnl::Numeraire::disabled());
 
     (tokio::spawn(transformer.run()), tokio::spawn(writer.run()))
 }
@@ -367,7 +367,16 @@ async fn a_killed_writer_resumes_from_its_offset() {
         group_id: &wr_group,
     })
     .expect("rows source #2");
-    let wr2 = tokio::spawn(Writer::new(pool.clone(), rows_source, 8, Duration::from_millis(5)).run());
+    let wr2 = tokio::spawn(
+        Writer::new(
+            pool.clone(),
+            rows_source,
+            8,
+            Duration::from_millis(5),
+            chainscope_indexer::pnl::Numeraire::disabled(),
+        )
+        .run(),
+    );
 
     wait_for_cursor(&pool, top, Duration::from_secs(60)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;

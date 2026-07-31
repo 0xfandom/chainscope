@@ -26,6 +26,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
     "bigdecimal",
     "chrono",
+    "json",
 ] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }

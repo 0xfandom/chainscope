@@ -232,7 +232,7 @@ async fn run_then_kill(pool: &PgPool, kill_after: Duration) {
     let transformer = Transformer::new(raw_source, row_sink, vec![SYNTHETIC_POOL]);
     // Small batches and a short flush so a randomised kill frequently lands
     // mid-batch, which is the case that matters most.
-    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(4));
+    let writer = Writer::new(pool.clone(), row_source, 8, Duration::from_millis(4), chainscope_indexer::pnl::Numeraire::disabled());
 
     let ph = tokio::spawn(producer.run());
     let th = tokio::spawn(transformer.run());

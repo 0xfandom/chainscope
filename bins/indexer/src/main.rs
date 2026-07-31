@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<ExitCode> {
         row_source,
         cfg.pipeline.batch_size,
         Duration::from_millis(cfg.pipeline.flush_interval_ms),
+        cfg.pnl.clone(),
     );
 
     // The finality tracker (#44) polls the tip and its finality line on the same

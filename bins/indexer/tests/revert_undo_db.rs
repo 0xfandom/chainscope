@@ -131,7 +131,7 @@ async fn the_writer_converges_to_canonical_on_a_revert() {
         chainscope_core::TransportSpec::Channel { capacity: 256 },
     )
     .unwrap();
-    let writer = Writer::new(pool.clone(), source, 8, Duration::from_millis(2));
+    let writer = Writer::new(pool.clone(), source, 8, Duration::from_millis(2), chainscope_indexer::pnl::Numeraire::disabled());
     let handle = tokio::spawn(writer.run());
 
     sink.publish(Envelope::Revert { from_block: FORK }).await.unwrap();
