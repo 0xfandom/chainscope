@@ -1442,6 +1442,164 @@ pub async fn flag_wash_trading(pool: &PgPool, p: &WashParams) -> anyhow::Result<
     Ok(excluded as u64)
 }
 
+// ---------------------------------------------------------------------------
+// Leaderboard and wallet scorecard (#75)
+//
+// Read-side aggregates. M7 turns these into HTTP; here they are plain typed `db`
+// functions so the API stays a thin layer and the exit test can assert them.
+// ---------------------------------------------------------------------------
+
+/// One leaderboard entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeaderRow {
+    pub wallet: Address20,
+    pub realized_pnl_usd: BigDecimal,
+    pub trades: i32,
+    pub wins: i32,
+    pub volume_usd: BigDecimal,
+}
+
+/// A wallet's still-open position in one token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenPosition {
+    pub token: Address20,
+    pub qty_held: BigDecimal,
+    pub cost_basis_usd: BigDecimal,
+}
+
+/// One realised drawdown in a wallet's recent history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RealizedTrade {
+    pub sell_block: i64,
+    pub token: Address20,
+    pub qty: BigDecimal,
+    pub proceeds_usd: BigDecimal,
+    pub realized_pnl_usd: BigDecimal,
+}
+
+/// The full picture for one wallet: its rollup, open positions (unrealised, kept
+/// separate from realised), and a recent realised trail.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scorecard {
+    pub wallet: Address20,
+    pub realized_pnl_usd: BigDecimal,
+    pub trades: i32,
+    pub wins: i32,
+    pub volume_usd: BigDecimal,
+    pub excluded: bool,
+    pub open_positions: Vec<OpenPosition>,
+    pub recent_realized: Vec<RealizedTrade>,
+}
+
+fn addr(bytes: Vec<u8>) -> Address20 {
+    bytes.try_into().unwrap_or([0; 20])
+}
+
+/// Recompute the watchlist snapshot. Cheap — the view is at most 100 rows.
+pub async fn refresh_leaderboard(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query("REFRESH MATERIALIZED VIEW leaderboard")
+        .execute(pool)
+        .await
+        .context("could not refresh the leaderboard")?;
+    Ok(())
+}
+
+/// The top `limit` wallets by realised PnL, wash-excluded, from the snapshot.
+pub async fn leaderboard(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<LeaderRow>> {
+    let rows = sqlx::query(
+        "SELECT wallet, realized_pnl_usd, trades, wins, volume_usd
+           FROM leaderboard
+          ORDER BY realized_pnl_usd DESC
+          LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("could not read the leaderboard")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| LeaderRow {
+            wallet: addr(r.get("wallet")),
+            realized_pnl_usd: r.get("realized_pnl_usd"),
+            trades: r.get("trades"),
+            wins: r.get("wins"),
+            volume_usd: r.get("volume_usd"),
+        })
+        .collect())
+}
+
+/// One wallet's scorecard, or `None` if the wallet has no stats. `recent` bounds
+/// the realised trail.
+pub async fn scorecard(
+    pool: &PgPool,
+    wallet: &Address20,
+    recent: i64,
+) -> anyhow::Result<Option<Scorecard>> {
+    let Some(s) = sqlx::query(
+        "SELECT realized_pnl_usd, trades, wins, volume_usd, excluded
+           FROM wallet_stats WHERE wallet = $1",
+    )
+    .bind(wallet.as_slice())
+    .fetch_optional(pool)
+    .await
+    .context("could not read wallet stats")?
+    else {
+        return Ok(None);
+    };
+
+    let positions = sqlx::query(
+        "SELECT token, qty_held, cost_basis_usd
+           FROM wallet_positions
+          WHERE wallet = $1 AND qty_held > 0
+          ORDER BY cost_basis_usd DESC",
+    )
+    .bind(wallet.as_slice())
+    .fetch_all(pool)
+    .await
+    .context("could not read open positions")?
+    .into_iter()
+    .map(|r| OpenPosition {
+        token: addr(r.get("token")),
+        qty_held: r.get("qty_held"),
+        cost_basis_usd: r.get("cost_basis_usd"),
+    })
+    .collect();
+
+    let recent_realized = sqlx::query(
+        "SELECT sell_block, token, qty_consumed, proceeds_usd, realized_pnl_usd
+           FROM lot_consumptions
+          WHERE wallet = $1
+          ORDER BY sell_block DESC, consume_seq DESC
+          LIMIT $2",
+    )
+    .bind(wallet.as_slice())
+    .bind(recent)
+    .fetch_all(pool)
+    .await
+    .context("could not read the realised trail")?
+    .into_iter()
+    .map(|r| RealizedTrade {
+        sell_block: r.get("sell_block"),
+        token: addr(r.get("token")),
+        qty: r.get("qty_consumed"),
+        proceeds_usd: r.get("proceeds_usd"),
+        realized_pnl_usd: r.get("realized_pnl_usd"),
+    })
+    .collect();
+
+    Ok(Some(Scorecard {
+        wallet: *wallet,
+        realized_pnl_usd: s.get("realized_pnl_usd"),
+        trades: s.get("trades"),
+        wins: s.get("wins"),
+        volume_usd: s.get("volume_usd"),
+        excluded: s.get("excluded"),
+        open_positions: positions,
+        recent_realized,
+    }))
+}
+
 /// Create the day partitions the raw event tables will need shortly.
 ///
 /// Called on every startup rather than only at migration time: a process that
