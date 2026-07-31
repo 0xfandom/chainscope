@@ -29,9 +29,13 @@ impl Alerter {
         }
     }
 
-    /// One detection pass. The detectors plug in here in #101/#102/#103; for now
-    /// it is a no-op so the loop and delivery spine can land on their own.
+    /// One detection pass. Each detector rescans a bounded recent window and
+    /// relies on the dedupe ledger to absorb the overlap between polls.
     async fn tick(&self) -> anyhow::Result<()> {
+        let moves = crate::detect::watchlist_moves(self).await?;
+        if moves > 0 {
+            tracing::info!(moves, "watchlist moves alerted");
+        }
         Ok(())
     }
 

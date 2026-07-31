@@ -30,9 +30,11 @@ fn config(database_url: String) -> Config {
         telegram_chat_id: "test".into(),
         poll_interval: Duration::from_secs(15),
         move_threshold_usd: 25_000.0,
+        move_lookback_blocks: 300,
         cluster_size: 3,
         cluster_window_secs: 7_200,
         watchlist_size: 100,
+        numeraire: chainscope_indexer::pnl::Numeraire::disabled(),
     }
 }
 

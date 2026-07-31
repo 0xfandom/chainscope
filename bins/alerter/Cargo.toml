@@ -13,6 +13,13 @@ name = "chainscope-alerter"
 path = "src/main.rs"
 
 [dependencies]
+# Reuse M6's swap valuation (pnl::classify + Numeraire) rather than re-deriving
+# it. This pulls the indexer lib (and librdkafka) into the build, which is fine
+# off the alerter's non-latency-critical path.
+chainscope-core = { path = "../../crates/core" }
+chainscope-indexer = { path = "../indexer" }
+bigdecimal.workspace = true
+hex.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
