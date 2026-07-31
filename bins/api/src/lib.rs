@@ -36,6 +36,8 @@ pub fn app(state: AppState) -> Router {
         .route("/pools/{address}", get(handlers::get_pool))
         .route("/pools/{address}/swaps", get(handlers::pool_swaps))
         .route("/pools/{address}/candles", get(handlers::pool_candles))
+        .route("/wallets/{address}", get(handlers::wallet_scorecard))
+        .route("/wallets/{address}/trades", get(handlers::wallet_trades))
         // A request that outlives this budget is a slow query, not a hang; cut it.
         .layer(TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
