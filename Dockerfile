@@ -26,5 +26,12 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+# Run from /app and ship the default config beside the binary: the indexer looks
+# for `chainscope.toml` at a path relative to its working directory, so without
+# both of these it starts in / with no config and crash-loops on a missing
+# chain_id. Secrets still come from the environment (.env / compose); this file
+# holds only the shareable defaults (chain id, pool list, tuning knobs).
+WORKDIR /app
 COPY --from=builder /app/service /usr/local/bin/service
+COPY --from=builder /app/chainscope.toml ./chainscope.toml
 ENTRYPOINT ["/usr/local/bin/service"]
