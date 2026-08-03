@@ -29,7 +29,11 @@ pools = [
     "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640", # USDC/WETH 0.3%
 ]
 
-# Where the backfill begins. 0 means "from pool creation".
+# Where indexing begins. For a live-follow demo without deep backfill, set this
+# near the current head (e.g. head - 7200 ≈ the last day) so the follower catches
+# up in minutes instead of crawling from genesis. For full history, use the pool
+# creation block (Uniswap V3 factory deployed at 12369621) — but that needs an
+# archive RPC, since free tiers cap eth_getLogs history.
 start_block = 0
 
 # How often the producer asks for the chain head. Ethereum produces a block
@@ -65,6 +69,18 @@ shutdown_timeout_ms = 10000
 # Blocks per historical backfill work unit. Shrinks automatically when a
 # provider rejects the range as too wide.
 backfill_chunk_size = 2000
+
+# PnL numeraire: which tokens count as "money" so a trade can be valued in USD.
+# Absent (as here) the profit fold is OFF and the indexer runs without PnL —
+# wallet_stats and the leaderboard stay empty. Uncomment and fill in to turn it
+# on. Rule: a token you list here is treated as money; a token you DON'T list is
+# an asset whose profit gets tracked. So to track WETH PnL on a USDC/WETH pool,
+# list USDC as a stable and leave WETH out.
+#
+# [pnl]
+# stables = ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"]  # USDC
+# weth = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"       # optional: value WETH as money
+# weth_price_pool = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"  # USDC/WETH pool to price WETH
 
 [log]
 # tracing-subscriber env filter. RUST_LOG overrides this.
